@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Implementation"
+  short_description: "Track features, slices, and completion"
+  default_prompt: "Use $manage-implementation to create or update implementation tracking for this repository."

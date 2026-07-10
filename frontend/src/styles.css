@@ -1,0 +1,374 @@
+@import "../../src/golazo/static/styles.css";
+
+#root {
+  min-height: 100vh;
+}
+
+.app-shell {
+  grid-template-columns: 292px minmax(0, 1fr);
+}
+
+.sidebar.desktop-sidebar {
+  padding-top: 52px;
+}
+
+.brand-mark {
+  object-fit: cover;
+}
+
+.projects-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 9px 10px;
+  color: #858c84;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.projects-heading button {
+  width: 27px;
+  height: 27px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #9da49b;
+  font-size: 18px;
+  cursor: pointer;
+}
+
+.projects-heading button:hover {
+  background: #252925;
+  color: var(--text);
+}
+
+.project-tree {
+  min-height: 0;
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  overflow-y: auto;
+  padding: 0 0 14px;
+}
+
+.project-block {
+  min-width: 0;
+}
+
+.project-header-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 27px;
+  align-items: center;
+  gap: 2px;
+}
+
+.project-header {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 25px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.project-header:hover {
+  background: #202420;
+}
+
+.project-header.active {
+  cursor: default;
+}
+
+.rename-icon-button,
+.icon-button {
+  display: grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #747c73;
+  cursor: pointer;
+}
+
+.rename-icon-button:hover,
+.icon-button:hover {
+  background: #292e29;
+  color: var(--text);
+}
+
+.project-header strong {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 580;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-folder {
+  position: relative;
+  width: 23px;
+  height: 16px;
+  border: 1.5px solid #cad0c8;
+  border-radius: 3px;
+}
+
+.project-folder::before {
+  content: "";
+  position: absolute;
+  top: -5px;
+  left: 1px;
+  width: 9px;
+  height: 5px;
+  border: 1.5px solid #cad0c8;
+  border-bottom: 0;
+  border-radius: 3px 3px 0 0;
+  background: var(--sidebar);
+}
+
+.project-header:hover .project-folder::before {
+  background: #202420;
+}
+
+.project-warning {
+  display: grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: #4b2924;
+  color: #ff9b87;
+  font-size: 10px;
+}
+
+.project-goals {
+  display: grid;
+  gap: 3px;
+  margin: 2px 0 0 38px;
+}
+
+.project-goal,
+.project-new-goal {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.project-goal {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  color: #d5dad2;
+  font-size: 12px;
+}
+
+.project-goal:hover,
+.project-new-goal:hover {
+  background: #252925;
+}
+
+.project-goal.active {
+  background: #343934;
+  color: #fff;
+}
+
+.project-goal span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-goal em {
+  color: #747c73;
+  font-size: 9px;
+  font-style: normal;
+}
+
+.project-goal.active em {
+  color: var(--lime);
+}
+
+.project-new-goal {
+  padding: 9px 10px;
+  color: #b9c0b6;
+  font-size: 11px;
+}
+
+.project-new-goal span {
+  margin-right: 6px;
+  color: var(--lime);
+}
+
+.project-empty {
+  padding: 7px 10px;
+  color: #626861;
+  font-size: 11px;
+}
+
+.connection-footer {
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.status-dot.offline {
+  background: #737a71;
+  box-shadow: none;
+}
+
+.thread-controls select {
+  max-width: 230px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--soft);
+  font-size: 11px;
+}
+
+.llm-config {
+  display: grid;
+  grid-template-columns: 112px minmax(150px, 1fr) 112px auto;
+  align-items: end;
+  gap: 9px;
+  padding: 10px 12px 8px;
+  border-top: 1px solid #303530;
+}
+
+.llm-config label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.llm-config label > span {
+  color: #7f877d;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.llm-config input,
+.llm-config select {
+  width: 100%;
+  height: 30px;
+  min-width: 0;
+  padding: 0 8px;
+  border: 1px solid #353b34;
+  border-radius: 7px;
+  outline: 0;
+  background: #191c19;
+  color: var(--soft);
+  font-size: 10px;
+}
+
+.llm-config select:disabled {
+  opacity: .65;
+}
+
+.llm-config input:focus,
+.llm-config select:focus {
+  border-color: #647553;
+}
+
+.config-save {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid #4d5844;
+  border-radius: 7px;
+  background: #252b23;
+  color: var(--lime);
+  font-size: 9px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.config-save:hover {
+  border-color: var(--lime);
+}
+
+.modal-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(5, 7, 5, 0.74);
+  backdrop-filter: blur(4px);
+}
+
+.react-dialog {
+  width: min(480px, calc(100vw - 32px));
+  padding: 22px;
+  border: 1px solid #3c4439;
+  border-radius: 14px;
+  background: #1c201c;
+  box-shadow: 0 30px 100px #000;
+}
+
+.react-dialog.workspace-dialog {
+  width: min(640px, calc(100vw - 32px));
+}
+
+.react-dialog form {
+  display: grid;
+  gap: 15px;
+}
+
+.react-dialog label {
+  display: grid;
+  gap: 7px;
+  color: var(--soft);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.react-dialog input,
+.react-dialog textarea {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: 0;
+  background: #151815;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.dialog-error {
+  margin: -4px 0 0;
+  color: #ff9f91;
+  font-size: 12px;
+}
+
+.desktop-drag-region {
+  -webkit-app-region: drag;
+}
+
+.desktop-drag-region button,
+.desktop-drag-region select,
+.desktop-drag-region textarea,
+.desktop-drag-region input {
+  -webkit-app-region: no-drag;
+}
+
+@media (max-width: 720px) {
+  .app-shell { grid-template-columns: 1fr; }
+  .project-tree { display: flex; overflow-x: auto; }
+  .project-block { min-width: 210px; }
+  .project-goals { margin-left: 22px; }
+  .llm-config { grid-template-columns: 1fr 1fr; }
+}
