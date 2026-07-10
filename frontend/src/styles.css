@@ -1,4 +1,4 @@
-@import "../../src/golazo/static/styles.css";
+@import "./base.css";
 
 #root {
   min-height: 100vh;

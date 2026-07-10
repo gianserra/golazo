@@ -2,7 +2,7 @@
 
 A desktop application around `codex exec` with a native Rust backend and deterministic, Markdown-backed implementation tracking.
 
-The product now has two application layers:
+The product has three application layers:
 
 - `frontend/`: React + TypeScript + Vite renderer shared by the browser and desktop app.
 - `electron/`: secure Electron main/preload processes that own the native window, directory picker, and backend lifecycle.
@@ -67,9 +67,9 @@ curl -X POST http://127.0.0.1:8765/runs \
 
 `POST /runs` starts `codex exec --json` in the configured workspace and returns a run resource immediately. Poll `GET /runs/{run_id}` for JSONL events, final output, and completion status. Working directories are constrained to the configured workspace, and the API exposes only `read-only` and `workspace-write` sandboxes.
 
-## Tracker CLI
+## Tracker Skill CLI
 
-The Rust backend owns the runtime tracker implementation. The Codex skill also includes a portable Python CLI for direct repository automation:
+The Rust backend owns the runtime tracker implementation. The Codex skill includes a small portable Python CLI for direct repository automation and Markdown audit maintenance:
 
 ```bash
 python skills/manage-implementation/scripts/implementation_tracker.py --help

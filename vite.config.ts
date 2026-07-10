@@ -13,7 +13,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: "../src/golazo/static-react",
+    outDir: "../rust-backend/static-react",
     emptyOutDir: true,
   },
 });

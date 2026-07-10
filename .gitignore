@@ -7,7 +7,7 @@
 .env.*
 !.env.example
 
-# Python environments and caches (legacy parity tooling / tracker CLI)
+# Python environments and caches (tracker skill tooling)
 .venv/
 .venv*/
 venv/
@@ -33,7 +33,7 @@ yarn-error.log*
 target/
 
 # Generated frontend, backend, and Electron artifacts
-src/golazo/static-react/
+rust-backend/static-react/
 dist/
 build/
 release/

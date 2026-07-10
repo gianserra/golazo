@@ -54,7 +54,7 @@ impl IntoResponse for ApiError {
 }
 
 #[derive(RustEmbed)]
-#[folder = "src/golazo/static-react/"]
+#[folder = "rust-backend/static-react/"]
 struct Frontend;
 
 fn tracker(state: &AppState, root: &Path) -> Tracker {
