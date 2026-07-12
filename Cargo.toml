@@ -30,3 +30,7 @@ tower = { version = "0.5", features = ["util"] }
 [[bin]]
 name = "golazo-backend"
 path = "rust-backend/main.rs"
+
+[[bin]]
+name = "golazo-tracker"
+path = "rust-backend/tracker_cli.rs"

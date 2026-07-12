@@ -5,7 +5,7 @@ description: Create and maintain Markdown implementation tracking for software g
 
 # Manage implementation
 
-Use `scripts/implementation_tracker.py` for every tracking mutation. Do not hand-edit the embedded metadata or calculate completion rates yourself.
+Use the Rust `golazo-tracker` CLI for every tracking mutation. Do not hand-edit the embedded metadata or calculate completion rates yourself.
 
 ## Workflow
 
@@ -25,12 +25,12 @@ Use `scripts/implementation_tracker.py` for every tracking mutation. Do not hand
 Run from the repository root:
 
 ```bash
-python skills/manage-implementation/scripts/implementation_tracker.py --root .goal-manager create-goal api-v1 "API v1"
-python skills/manage-implementation/scripts/implementation_tracker.py --root .goal-manager add-feature api-v1 auth "Authentication"
-python skills/manage-implementation/scripts/implementation_tracker.py --root .goal-manager add-step api-v1 auth tokens "Issue access tokens"
-python skills/manage-implementation/scripts/implementation_tracker.py --root .goal-manager set-step api-v1 auth tokens done
-python skills/manage-implementation/scripts/implementation_tracker.py --root .goal-manager add-slice api-v1 auth "Implemented token issuance" --status Partial --evidence tests/test_auth.py
-python skills/manage-implementation/scripts/implementation_tracker.py --root .goal-manager validate api-v1
+node scripts/run-cargo.mjs run --quiet --bin golazo-tracker -- --root .goal-manager create-goal api-v1 "API v1"
+node scripts/run-cargo.mjs run --quiet --bin golazo-tracker -- --root .goal-manager add-feature api-v1 auth "Authentication"
+node scripts/run-cargo.mjs run --quiet --bin golazo-tracker -- --root .goal-manager add-step api-v1 auth tokens "Issue access tokens"
+node scripts/run-cargo.mjs run --quiet --bin golazo-tracker -- --root .goal-manager set-step api-v1 auth tokens done
+node scripts/run-cargo.mjs run --quiet --bin golazo-tracker -- --root .goal-manager add-slice api-v1 auth "Implemented token issuance" --status Partial --evidence tests/test_auth.rs
+node scripts/run-cargo.mjs run --quiet --bin golazo-tracker -- --root .goal-manager validate api-v1
 ```
 
 Repeat `--evidence` for multiple evidence entries. Treat evidence as a short factual pointer, not a narrative.
@@ -40,9 +40,8 @@ Repeat `--evidence` for multiple evidence entries. Treat evidence as a short fac
 - Use only `Planned`, `Blocked`, `Partial`, or `Done` for feature and slice statuses.
 - Derive completion as completed steps divided by total steps. A feature with no steps is 0% complete.
 - Keep status independent from completion. Status expresses delivery state; checkboxes provide the deterministic rate.
-- Record one slice per coherent change set. The script automatically starts the next file after 100 slices.
+- Record one slice per coherent change set. The CLI automatically starts the next file after 100 slices.
 - Never rewrite or delete historical slices to make progress appear cleaner.
 - Validate after conflict resolution or manual Markdown repair.
 
 Read [references/format.md](references/format.md) only when integrating another tool with the Markdown files or repairing invalid tracking data.
-

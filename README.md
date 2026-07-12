@@ -69,10 +69,10 @@ curl -X POST http://127.0.0.1:8765/runs \
 
 ## Tracker Skill CLI
 
-The Rust backend owns the runtime tracker implementation. The Codex skill includes a small portable Python CLI for direct repository automation and Markdown audit maintenance:
+The Rust backend owns the runtime tracker implementation. The Codex skill uses the same Rust tracker core through a small CLI for direct repository automation and Markdown audit maintenance:
 
 ```bash
-python skills/manage-implementation/scripts/implementation_tracker.py --help
+node scripts/run-cargo.mjs run --quiet --bin golazo-tracker -- --help
 ```
 
 The checked-in `.agents/skills/manage-implementation` discovery link exposes this skill to Codex CLI runs launched in the repository.

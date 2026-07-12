@@ -7,7 +7,7 @@
 .env.*
 !.env.example
 
-# Python environments and caches (tracker skill tooling)
+# Python environments and caches
 .venv/
 .venv*/
 venv/
