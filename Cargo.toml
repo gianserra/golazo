@@ -1,0 +1,37 @@
+[package]
+name = "golazo-backend"
+version = "0.1.0"
+edition = "2024"
+description = "Native Rust backend for Golazo"
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+fs2 = "0.4"
+mime_guess = "2"
+regex = "1"
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+which = "8"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "golazo-backend"
+path = "rust-backend/main.rs"
+
+[[bin]]
+name = "golazo-tracker"
+path = "rust-backend/tracker_cli.rs"
