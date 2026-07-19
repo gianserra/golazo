@@ -50,6 +50,31 @@ function createMenu() {
       ],
     },
     {
+      label: "Edit",
+      submenu: [
+        { role: "undo" },
+        { role: "redo" },
+        { type: "separator" },
+        { role: "cut" },
+        { role: "copy" },
+        { role: "paste" },
+        ...(process.platform === "darwin" ? [
+          { role: "pasteAndMatchStyle" },
+          { role: "delete" },
+          { role: "selectAll" },
+          { type: "separator" },
+          {
+            label: "Speech",
+            submenu: [{ role: "startSpeaking" }, { role: "stopSpeaking" }],
+          },
+        ] : [
+          { role: "delete" },
+          { type: "separator" },
+          { role: "selectAll" },
+        ]),
+      ],
+    },
+    {
       label: "Chat",
       submenu: [
         { label: "New Chat", accelerator: "CmdOrCtrl+Shift+N", click: () => sendMenuCommand("new-chat") },
@@ -165,6 +190,25 @@ async function createWindow() {
     },
   });
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  mainWindow.webContents.on("context-menu", (_event, params) => {
+    const flags = params.editFlags || {};
+    let template = [];
+    if (params.isEditable) {
+      template = [
+        { role: "undo", enabled: Boolean(flags.canUndo) },
+        { role: "redo", enabled: Boolean(flags.canRedo) },
+        { type: "separator" },
+        { role: "cut", enabled: Boolean(flags.canCut) },
+        { role: "copy", enabled: Boolean(flags.canCopy) },
+        { role: "paste", enabled: Boolean(flags.canPaste) },
+        { type: "separator" },
+        { role: "selectAll", enabled: Boolean(flags.canSelectAll) },
+      ];
+    } else if (params.selectionText) {
+      template = [{ role: "copy", enabled: Boolean(flags.canCopy) }];
+    }
+    if (template.length) Menu.buildFromTemplate(template).popup({ window: mainWindow });
+  });
   const rendererUrl = process.env.ELECTRON_RENDERER_URL || backendUrl;
   await mainWindow.loadURL(rendererUrl);
 }

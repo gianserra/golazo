@@ -31,6 +31,7 @@ node scripts/run-cargo.mjs run --quiet --bin golazo-tracker -- --root .goal-mana
 node scripts/run-cargo.mjs run --quiet --bin golazo-tracker -- --root .goal-manager set-step api-v1 auth tokens done
 node scripts/run-cargo.mjs run --quiet --bin golazo-tracker -- --root .goal-manager add-slice api-v1 auth "Implemented token issuance" --status Partial --evidence tests/test_auth.rs
 node scripts/run-cargo.mjs run --quiet --bin golazo-tracker -- --root .goal-manager validate api-v1
+node scripts/run-cargo.mjs run --quiet --bin golazo-tracker -- --root .goal-manager format api-v1
 ```
 
 Repeat `--evidence` for multiple evidence entries. Treat evidence as a short factual pointer, not a narrative.
@@ -42,6 +43,7 @@ Repeat `--evidence` for multiple evidence entries. Treat evidence as a short fac
 - Keep status independent from completion. Status expresses delivery state; checkboxes provide the deterministic rate.
 - Record one slice per coherent change set. The CLI automatically starts the next file after 100 slices.
 - Never rewrite or delete historical slices to make progress appear cleaner.
+- Use `format [goal-id]` only to regenerate the human-readable projection and move legacy metadata comments to the footer; it does not alter tracking history.
 - Validate after conflict resolution or manual Markdown repair.
 
 Read [references/format.md](references/format.md) only when integrating another tool with the Markdown files or repairing invalid tracking data.

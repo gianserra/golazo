@@ -84,6 +84,9 @@ enum Command {
     Validate {
         goal_id: String,
     },
+    Format {
+        goal_id: Option<String>,
+    },
     List,
     GenerateId {
         title: String,
@@ -149,6 +152,10 @@ fn run() -> Result<(), CliError> {
         } => print_json(tracker.add_slice(&goal_id, &feature_id, &summary, status, evidence)?)?,
         Command::Show { goal_id } => print_json(tracker.get_goal(&goal_id)?)?,
         Command::Validate { goal_id } => print_json(tracker.validate(&goal_id)?)?,
+        Command::Format { goal_id } => match goal_id {
+            Some(goal_id) => print_json(tracker.format_goal(&goal_id)?)?,
+            None => print_json(tracker.format_all()?)?,
+        },
         Command::List => print_json(tracker.list_goals()?)?,
         Command::GenerateId { title } => print_json(serde_json::json!({
             "goal_id": tracker::generate_goal_id(&title)
@@ -236,6 +243,13 @@ fn parse(args: &mut Vec<String>) -> Result<Parsed, CliError> {
         "validate" => Command::Validate {
             goal_id: take(args, "goal_id")?,
         },
+        "format" => Command::Format {
+            goal_id: if args.is_empty() {
+                None
+            } else {
+                Some(take(args, "goal_id")?)
+            },
+        },
         "list" | "list-goals" => Command::List,
         "generate-id" => Command::GenerateId {
             title: take(args, "title")?,
@@ -304,6 +318,7 @@ Commands:
   add-slice <goal_id> <feature_id> <summary> [--status <status>] [--evidence <text>]...
   show <goal_id>
   validate <goal_id>
+  format [goal_id]
   list
   generate-id <title>"
 }

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Golazo goal siren alternate icon</title>
+  <desc id="desc">A lime letter G becomes a celebratory goal horn with three loud broadcast marks.</desc>
+  <rect x="56" y="56" width="912" height="912" rx="206" fill="#111411"/>
+  <rect x="92" y="92" width="840" height="840" rx="176" fill="#1d221d"/>
+  <path d="M746 334A282 282 0 1 0 756 693" fill="none" stroke="#d8f58a" stroke-width="122" stroke-linecap="square"/>
+  <path d="M540 506h208" fill="none" stroke="#d8f58a" stroke-width="112" stroke-linecap="round"/>
+  <path d="M745 506v127" fill="none" stroke="#d8f58a" stroke-width="112" stroke-linecap="round"/>
+  <path d="M741 559l126-70v207l-126-70z" fill="#f4f2df"/>
+  <circle cx="342" cy="360" r="57" fill="#f4f2df"/>
+  <path d="M794 390l58-69M844 430l84-30M770 344l25-87" fill="none" stroke="#d8f58a" stroke-width="28" stroke-linecap="round"/>
+</svg>

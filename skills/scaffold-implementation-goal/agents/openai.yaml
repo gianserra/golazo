@@ -1,0 +1,4 @@
+interface:
+  display_name: "Scaffold Implementation Goal"
+  short_description: "Turn goals into reviewable implementation plans"
+  default_prompt: "Use $scaffold-implementation-goal to inspect this goal and propose a reviewable implementation tracker."

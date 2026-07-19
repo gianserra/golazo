@@ -1,12 +1,12 @@
 # Tracking format
 
-Every generated Markdown file begins with a single HTML comment:
+Every generated Markdown file ends with a single HTML comment:
 
 ```text
 <!-- codex-goal-manager:{...canonical JSON...} -->
 ```
 
-The JSON is the machine record. The remaining Markdown is a deterministic human-readable projection and may be regenerated after any mutation.
+The JSON is the machine record. It lives at the bottom so the document opens with its human-readable title and content. The preceding Markdown is a deterministic projection and may be regenerated after any mutation. The tracker continues to read legacy files whose metadata comment is at the top.
 
 ## Goal file
 
@@ -29,5 +29,4 @@ Each slice contains an ID, feature ID, UTC timestamp, summary, feature status af
 
 ## Repair
 
-Prefer restoring the last valid file from version control. If manual repair is unavoidable, update the first-line JSON and run a harmless tracker mutation or reconstruct the visible Markdown. Always finish with `validate`.
-
+Prefer restoring the last valid file from version control. If manual repair is unavoidable, update the footer JSON and run `golazo-tracker format <goal-id>` to reconstruct the visible Markdown. Running `golazo-tracker format` without a goal ID migrates every tracking document beneath the selected root. Always finish with `validate`.

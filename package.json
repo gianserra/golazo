@@ -9,7 +9,7 @@
   "scripts": {
     "assets:icons": "node scripts/generate-icons.mjs",
     "dev:frontend": "vite --host 127.0.0.1 --port 5173",
-    "dev:electron": "node scripts/run-cargo.mjs build && cross-env ELECTRON_RENDERER_URL=http://127.0.0.1:5173 electron .",
+    "dev:electron": "node scripts/run-cargo.mjs build && cross-env ELECTRON_RENDERER_URL=http://127.0.0.1:5173 node scripts/run-electron-dev.mjs",
     "dev": "concurrently -k -s first \"pnpm dev:frontend\" \"wait-on http://127.0.0.1:5173 && pnpm dev:electron\"",
     "build:frontend": "vite build",
     "build:backend": "node scripts/run-cargo.mjs build --release && node scripts/stage-rust-backend.mjs",
@@ -37,6 +37,7 @@
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
+      "icon": "electron/assets/icon.icns",
       "target": [
         "dmg",
         "zip"

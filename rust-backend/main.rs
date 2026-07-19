@@ -1,4 +1,5 @@
 mod api;
+mod app_server;
 mod models;
 mod projects;
 mod runner;
@@ -59,6 +60,7 @@ async fn main() {
         browse_root,
         registry,
         active_project_id: Arc::new(RwLock::new(active.id)),
+        profile_path: app_data.join("profile.json"),
     };
     let port = env::var("GOLAZO_PORT")
         .ok()
