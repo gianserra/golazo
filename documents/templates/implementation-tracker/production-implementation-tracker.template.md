@@ -21,10 +21,9 @@ This document tracks production implementation work for `<APP_REPO>`.
   receipt, or production-readiness status change.
 - Keep rows production-focused. Do not add experiment inventories, paper/source inventories, or
   benchmark bibliography rows here.
-- Keep the Status Rollup current whenever a row is added, removed, or changes status.
+- Regenerate the Status Rollup with the tracker script whenever a row is added, removed, or changes status; agents must not calculate or hand-edit rollup values.
 - Count only exact `Done`, `Partial`, `Planned`, and `Blocked` cells in the Implementation Matrix.
-- Calculate Done % as `Done / (Done + Partial + Planned + Blocked) * 100`, rounded to one decimal
-  place.
+- The tracker script calculates Done % as `Done / (Done + Partial + Planned + Blocked) * 100`, rounded to one decimal place.
 - Do not mark a row Done for documentation-only progress; Done requires runnable code and the
   smallest useful verification.
 - Slice archive files are audit-only. AI agents should not read through, summarize, rewrite, or
@@ -108,6 +107,9 @@ Escalate to heavier infrastructure only when this table cannot be covered cleanl
 simple strategy.
 
 ## Next Slice Checklist
+
+Only include work explicitly selected for the next coherent implementation slice. Keep all other
+remaining work in the feature details or implementation matrix.
 
 - [ ] <Next implementation task>
 - [ ] Update this tracker rollup after the first implementation slice.

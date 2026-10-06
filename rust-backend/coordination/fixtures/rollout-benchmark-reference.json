@@ -1,0 +1,52 @@
+{
+  "observations": [
+    {
+      "id": "single-a",
+      "workloadId": "independent-feature-pair-a",
+      "mode": "single_worker",
+      "startedAt": "2026-10-06T12:00:00Z",
+      "finishedAt": "2026-10-06T13:00:00Z",
+      "completedUnits": 2,
+      "totalTokens": 20000,
+      "conflictEvents": 1,
+      "integrationLatencyMilliseconds": [120000, 180000],
+      "humanInterruptions": 2
+    },
+    {
+      "id": "single-b",
+      "workloadId": "independent-feature-pair-b",
+      "mode": "single_worker",
+      "startedAt": "2026-10-06T13:00:00Z",
+      "finishedAt": "2026-10-06T14:00:00Z",
+      "completedUnits": 2,
+      "totalTokens": 18000,
+      "conflictEvents": 0,
+      "integrationLatencyMilliseconds": [90000, 150000],
+      "humanInterruptions": 1
+    },
+    {
+      "id": "pooled-a",
+      "workloadId": "independent-feature-pair-a",
+      "mode": "pooled",
+      "startedAt": "2026-10-06T12:00:00Z",
+      "finishedAt": "2026-10-06T12:30:00Z",
+      "completedUnits": 2,
+      "totalTokens": 11000,
+      "conflictEvents": 1,
+      "integrationLatencyMilliseconds": [90000, 120000],
+      "humanInterruptions": 1
+    },
+    {
+      "id": "pooled-b",
+      "workloadId": "independent-feature-pair-b",
+      "mode": "pooled",
+      "startedAt": "2026-10-06T13:00:00Z",
+      "finishedAt": "2026-10-06T13:30:00Z",
+      "completedUnits": 2,
+      "totalTokens": 10000,
+      "conflictEvents": 0,
+      "integrationLatencyMilliseconds": [60000, 90000],
+      "humanInterruptions": 0
+    }
+  ]
+}
