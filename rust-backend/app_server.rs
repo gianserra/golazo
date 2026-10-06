@@ -1,3 +1,6 @@
+use crate::coordination::security::{
+    redact_environment_credentials, redact_environment_credentials_text,
+};
 use crate::models::{
     AppServerApproval, AppServerEvent, AppServerThread, AppServerThreadPage, LLMConfig, RunImage,
     SpeedMode,
@@ -29,6 +32,7 @@ pub struct StartedTurn {
 struct PendingApproval {
     public: AppServerApproval,
     rpc_id: Value,
+    response_params: Value,
 }
 
 enum RpcCommand {
@@ -137,6 +141,34 @@ impl AppServerClient {
         Ok(())
     }
 
+    pub async fn fork_thread(
+        &self,
+        workspace: &Path,
+        thread_id: &str,
+        application_context: &str,
+        config: &LLMConfig,
+    ) -> Result<String, String> {
+        let response: Value = self
+            .request(
+                "thread/fork",
+                json!({
+                    "threadId": thread_id,
+                    "cwd": workspace,
+                    "developerInstructions": application_context,
+                    "model": optional_string(&config.model),
+                    "serviceTier": if matches!(config.speed, SpeedMode::Fast) { Some("fast") } else { None },
+                    "deferGoalContinuation": true,
+                    "excludeTurns": true
+                }),
+            )
+            .await?;
+        response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "thread/fork returned no thread id".to_string())
+    }
+
     pub async fn start_turn(
         &self,
         workspace: &Path,
@@ -150,6 +182,7 @@ impl AppServerClient {
         approvals_reviewer: &str,
         config: &LLMConfig,
         ephemeral: bool,
+        thread_config: Option<&Value>,
     ) -> Result<StartedTurn, String> {
         let thread_id = if let Some(thread_id) = thread_id {
             let response: Value = self.request("thread/resume", json!({
@@ -160,7 +193,8 @@ impl AppServerClient {
                 "approvalPolicy": approval_policy,
                 "approvalsReviewer": approvals_reviewer,
                 "model": optional_string(&config.model),
-                "serviceTier": if matches!(config.speed, SpeedMode::Fast) { Some("fast") } else { None }
+                "serviceTier": if matches!(config.speed, SpeedMode::Fast) { Some("fast") } else { None },
+                "config": thread_config
             })).await?;
             response
                 .pointer("/thread/id")
@@ -176,7 +210,8 @@ impl AppServerClient {
                 "approvalsReviewer": approvals_reviewer,
                 "model": optional_string(&config.model),
                 "serviceTier": if matches!(config.speed, SpeedMode::Fast) { Some("fast") } else { None },
-                "ephemeral": ephemeral
+                "ephemeral": ephemeral,
+                "config": thread_config
             })).await?;
             response
                 .pointer("/thread/id")
@@ -246,8 +281,7 @@ impl AppServerClient {
         let result = if approval.public.method == "item/permissions/requestApproval" {
             let permissions = if matches!(decision, "accept" | "acceptForSession") {
                 approval
-                    .public
-                    .params
+                    .response_params
                     .get("permissions")
                     .cloned()
                     .unwrap_or_else(|| json!({}))
@@ -384,7 +418,7 @@ async fn run_actor(
                     {
                         if let Some(reply) = pending.remove(&id) {
                             let result = if let Some(error) = message.get("error") {
-                                Err(format!("app-server request failed: {error}"))
+                                Err(redact_environment_credentials_text(&format!("app-server request failed: {error}")))
                             } else {
                                 message.get("result").cloned().ok_or("app-server response had no result".into())
                             };
@@ -393,7 +427,9 @@ async fn run_actor(
                         continue;
                     }
                     let method = message.get("method").and_then(Value::as_str).unwrap_or("unknown");
-                    let params = message.get("params").cloned().unwrap_or(Value::Null);
+                    let response_params = message.get("params").cloned().unwrap_or(Value::Null);
+                    let mut params = response_params.clone();
+                    redact_environment_credentials(&mut params);
                     let event = AppServerEvent {
                         sequence: sequence.fetch_add(1, Ordering::Relaxed),
                         method: method.into(),
@@ -412,7 +448,7 @@ async fn run_actor(
                         let approval = AppServerApproval::new(&approval_id, method, params);
                         approvals.write().await.insert(
                             approval_id,
-                            PendingApproval { public: approval, rpc_id },
+                            PendingApproval { public: approval, rpc_id, response_params },
                         );
                     }
                 }
@@ -575,6 +611,12 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         let client = AppServerClient::new(executable.to_string_lossy());
         let output_schema = json!({"type": "object"});
+        let thread_config = json!({
+            "shell_environment_policy": {
+                "inherit": "none",
+                "set": {"HOME": "/isolated/worker/home"}
+            }
+        });
 
         client
             .start_turn(
@@ -589,6 +631,7 @@ mod tests {
                 "auto_review",
                 &LLMConfig::default(),
                 false,
+                Some(&thread_config),
             )
             .await
             .unwrap();
@@ -600,6 +643,7 @@ mod tests {
             thread_request["params"]["developerInstructions"],
             "Private Golazo execution context"
         );
+        assert_eq!(thread_request["params"]["config"], thread_config);
         let request: Value = serde_json::from_str(&fs::read_to_string(capture).unwrap()).unwrap();
         assert_eq!(request["method"], "turn/start");
         assert_eq!(request["params"]["input"][0]["text"], "Visible user prompt");
@@ -639,6 +683,7 @@ mod tests {
                 "user",
                 &LLMConfig::default(),
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -650,5 +695,83 @@ mod tests {
             request["params"]["developerInstructions"],
             "Updated Build mode guidance"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forks_a_thread_with_replacement_mode_instructions() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("fake-codex");
+        let capture = temp.path().join("fork-request.json");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' '{{\"id\":1,\"result\":{{}}}}'\nIFS= read -r line\nIFS= read -r line\nprintf '%s\\n' \"$line\" > '{}'\nprintf '%s\\n' '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-build\"}}}}}}'\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let client = AppServerClient::new(executable.to_string_lossy());
+
+        let continued = client
+            .fork_thread(
+                temp.path(),
+                "thread-spec",
+                "Build mode guidance",
+                &LLMConfig::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(continued, "thread-build");
+        let request: Value = serde_json::from_str(&fs::read_to_string(capture).unwrap()).unwrap();
+        assert_eq!(request["method"], "thread/fork");
+        assert_eq!(request["params"]["threadId"], "thread-spec");
+        assert_eq!(
+            request["params"]["developerInstructions"],
+            "Build mode guidance"
+        );
+        assert_eq!(request["params"]["deferGoalContinuation"], true);
+        assert_eq!(request["params"]["excludeTurns"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn redacts_environment_credentials_before_broadcasting_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("fake-codex");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nsleep 1\nprintf '%s\\n' '{\"method\":\"item/test\",\"params\":{\"OPENAI_API_KEY\":\"sk-sensitive\",\"message\":\"GITHUB_TOKEN=gh-sensitive\"}}'\nsleep 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let client = AppServerClient::new(executable.to_string_lossy());
+        let mut events = client.subscribe();
+
+        let event = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.method == "item/test" {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            event.params["OPENAI_API_KEY"],
+            crate::coordination::security::REDACTED_CREDENTIAL
+        );
+        assert_eq!(
+            event.params["message"],
+            format!(
+                "GITHUB_TOKEN={}",
+                crate::coordination::security::REDACTED_CREDENTIAL
+            )
+        );
+        assert!(!event.params.to_string().contains("sensitive"));
     }
 }

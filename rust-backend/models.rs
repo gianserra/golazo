@@ -1,6 +1,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppServerEvent {
@@ -97,6 +98,12 @@ pub struct Step {
     pub id: String,
     pub title: String,
     pub done: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub next: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +118,41 @@ pub struct Feature {
     pub steps: Vec<Step>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessPolicy {
+    #[default]
+    AllDependenciesDone,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationScope {
+    #[default]
+    WorkPackage,
+    Repository,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackerWorkPackage {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub feature_ids: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub status: Status,
+    #[serde(default)]
+    pub readiness_policy: ReadinessPolicy,
+    #[serde(default)]
+    pub integration_scope: IntegrationScope,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalRecord {
     pub version: u8,
@@ -123,6 +165,8 @@ pub struct GoalRecord {
     pub updated_at: String,
     #[serde(default)]
     pub features: Vec<Feature>,
+    #[serde(default)]
+    pub work_packages: Vec<TrackerWorkPackage>,
     #[serde(default)]
     pub slice_files: Vec<String>,
 }
@@ -285,11 +329,14 @@ pub struct StepCreate {
     pub title: String,
     #[serde(default)]
     pub done: bool,
+    #[serde(default)]
+    pub next: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct StepUpdate {
-    pub done: bool,
+    pub done: Option<bool>,
+    pub next: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +549,16 @@ pub struct Usage {
     pub total_tokens: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerCredentialIsolation {
+    pub worker_id: String,
+    pub home_directory: String,
+    pub temporary_directory: String,
+    pub inherited_environment: String,
+    pub environment: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
     pub id: String,
@@ -518,6 +575,8 @@ pub struct Run {
     pub approvals_reviewer: String,
     #[serde(default)]
     pub ephemeral_thread: bool,
+    #[serde(default)]
+    pub credential_isolation: Option<WorkerCredentialIsolation>,
     pub execution_prompt: Option<String>,
     #[serde(default, skip_serializing)]
     pub output_schema: Option<Value>,

@@ -29,9 +29,9 @@ Use `slice-records-001-100.md` for the first 100 implementation slice records. W
 contains 100 `### Slice ...` headings, create `slice-records-101-200.md` and add a new row to the
 slice archive README. The archive README is the count/index source of truth.
 
-Do not use slice records as a handoff queue. Put actionable remaining work in the active tracker:
-Implementation Matrix completion bars, Next Slice Checklist, Risk Register, or Failure Scenario
-Coverage.
+Do not use slice records as a handoff queue. Keep all remaining work in the active tracker, but put
+only explicitly selected near-term work in the Next Slice Checklist. The Implementation Matrix,
+feature details, Risk Register, and Failure Scenario Coverage hold the broader backlog.
 
 Keep this tracker production-focused. Do not add research bibliography, experiment inventory, or
 source extraction sections unless the app itself is a research artifact.

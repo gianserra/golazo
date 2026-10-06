@@ -136,10 +136,13 @@ function codexExecutable() {
 
 function startBackend() {
   const command = backendCommand();
+  const bundledToolPath = path.dirname(command.executable);
+  const childPath = [bundledToolPath, process.env.PATH].filter(Boolean).join(path.delimiter);
   backendProcess = spawn(command.executable, command.args, {
     cwd: process.env.CODEX_WORKSPACE_ROOT || app.getPath("home"),
     env: {
       ...process.env,
+      PATH: childPath,
       CODEX_EXECUTABLE: codexExecutable(),
       GOLAZO_PORT: String(port),
       GOAL_MANAGER_BROWSE_ROOT: process.env.GOAL_MANAGER_BROWSE_ROOT || app.getPath("home"),

@@ -1,0 +1,74 @@
+[
+  {
+    "id": "benign-overlap-awareness",
+    "scenario": "Two workers touch the same generated index but their owned source paths and contracts remain independent.",
+    "expectedDecision": "inform",
+    "confidencePercent": 76,
+    "affectedWorkerCount": 1,
+    "evidenceMode": "event",
+    "summary": "The overlap is material awareness but does not invalidate either worker's assumptions.",
+    "recommendation": "",
+    "requestedAction": null,
+    "requiresHumanDecision": false
+  },
+  {
+    "id": "semantic-conflict-coordinate",
+    "scenario": "Two active workers changed incompatible semantics behind the same shared API contract.",
+    "expectedDecision": "coordinate",
+    "confidencePercent": 94,
+    "affectedWorkerCount": 2,
+    "evidenceMode": "both",
+    "summary": "The shared API changes are semantically incompatible and require narrow sequencing.",
+    "recommendation": "Reconcile the producer contract before either dependent change advances.",
+    "requestedAction": "Pause dependent edits until the contract reconciliation is published.",
+    "requiresHumanDecision": false
+  },
+  {
+    "id": "stale-contract-recommendation",
+    "scenario": "One worker still expects contract revision 2 after the producer published revision 3.",
+    "expectedDecision": "recommend",
+    "confidencePercent": 91,
+    "affectedWorkerCount": 1,
+    "evidenceMode": "both",
+    "summary": "The worker's expected contract revision is stale relative to durable registry evidence.",
+    "recommendation": "Refresh context and revalidate against contract revision 3.",
+    "requestedAction": null,
+    "requiresHumanDecision": false
+  },
+  {
+    "id": "stalled-worker-block",
+    "scenario": "A worker exceeded its execution limit and repeated the same validation failure without progress.",
+    "expectedDecision": "block",
+    "confidencePercent": 98,
+    "affectedWorkerCount": 1,
+    "evidenceMode": "event",
+    "summary": "Deterministic watchdog evidence shows continuing this affected worker is unsafe.",
+    "recommendation": "",
+    "requestedAction": "Keep the affected worker paused pending recovery.",
+    "requiresHumanDecision": false
+  },
+  {
+    "id": "false-alarm-observe",
+    "scenario": "A low-impact path overlap is fully generated, contracts match, and both validation suites pass.",
+    "expectedDecision": "observe",
+    "confidencePercent": 87,
+    "affectedWorkerCount": 0,
+    "evidenceMode": "none",
+    "summary": "The supplied evidence does not justify outward action.",
+    "recommendation": "",
+    "requestedAction": null,
+    "requiresHumanDecision": false
+  },
+  {
+    "id": "product-direction-human-decision",
+    "scenario": "Two technically valid public API directions have different compatibility and product consequences.",
+    "expectedDecision": "escalate",
+    "confidencePercent": 96,
+    "affectedWorkerCount": 0,
+    "evidenceMode": "reference",
+    "summary": "The remaining choice is a consequential product decision rather than an implementation fact.",
+    "recommendation": "",
+    "requestedAction": null,
+    "requiresHumanDecision": true
+  }
+]

@@ -1,13 +1,19 @@
 use crate::app_server::AppServerClient;
+use crate::coordination::domain::{Worker, WorkerToolCapability};
+use crate::coordination::security::{
+    redact_environment_credentials, redact_environment_credentials_text,
+};
 use crate::models::{
     AppServerThread, AppServerThreadPage, CodexAuthAction, CodexAuthStatus, FileAttachmentCreate,
     ImageAttachmentCreate, LLMConfig, LLMProvider, ReasoningLevel, Run, RunFile, RunImage,
-    SpeedMode, Usage, WorkMode,
+    SpeedMode, Usage, WorkMode, WorkerCredentialIsolation,
 };
+use crate::observability::CorrelationIds;
+use crate::redaction::{redact_sensitive_value, redacted_copy};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -39,8 +45,41 @@ fn prompt_title(prompt: &str) -> String {
     if title.is_empty() {
         "Untitled thread".into()
     } else {
-        title.chars().take(80).collect()
+        redact_environment_credentials_text(&title.chars().take(80).collect::<String>())
     }
+}
+
+fn redact_app_server_thread(thread: &mut AppServerThread) {
+    thread.preview = redact_environment_credentials_text(&thread.preview);
+    if let Some(name) = &mut thread.name {
+        *name = redact_environment_credentials_text(name);
+    }
+    redact_sensitive_value(&mut thread.source);
+    redact_sensitive_value(&mut thread.status);
+    for turn in &mut thread.turns {
+        redact_sensitive_value(turn);
+    }
+}
+
+fn run_correlation(run: &Run) -> CorrelationIds {
+    let mut ids = run
+        .goal_id
+        .as_deref()
+        .map(CorrelationIds::for_goal)
+        .unwrap_or_default()
+        .with_run(&run.id)
+        .with_workspace(&run.cwd);
+    if let Some(worker_id) = run
+        .credential_isolation
+        .as_ref()
+        .map(|isolation| isolation.worker_id.as_str())
+    {
+        ids = ids.with_worker(worker_id);
+    }
+    if let Some(thread_id) = run.thread_id.as_deref().or(run.resumed_from.as_deref()) {
+        ids = ids.with_thread(thread_id);
+    }
+    ids
 }
 
 fn app_server_time(value: i64) -> String {
@@ -83,6 +122,41 @@ fn codex_exec_args(sandbox: &str, approval_policy: &str, approvals_reviewer: &st
         "--config".into(),
         format!("approvals_reviewer=\"{approvals_reviewer}\""),
     ]
+}
+
+fn worker_shell_environment_config(policy: &WorkerCredentialIsolation) -> Value {
+    serde_json::json!({
+        "shell_environment_policy": {
+            "inherit": policy.inherited_environment,
+            "ignore_default_excludes": false,
+            "set": policy.environment,
+        }
+    })
+}
+
+fn append_worker_shell_environment_args(
+    args: &mut Vec<String>,
+    policy: &WorkerCredentialIsolation,
+) {
+    args.extend([
+        "--config".into(),
+        format!(
+            "shell_environment_policy.inherit={}",
+            serde_json::to_string(&policy.inherited_environment)
+                .unwrap_or_else(|_| "\"none\"".into())
+        ),
+        "--config".into(),
+        "shell_environment_policy.ignore_default_excludes=false".into(),
+    ]);
+    for (name, value) in &policy.environment {
+        args.extend([
+            "--config".into(),
+            format!(
+                "shell_environment_policy.set.{name}={}",
+                serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
+            ),
+        ]);
+    }
 }
 
 fn decode_attachment_base64(value: &str) -> Result<Vec<u8>, String> {
@@ -188,6 +262,16 @@ pub struct ThreadSummary {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunnerRecoveryReport {
+    pub interrupted_run_ids: Vec<String>,
+    pub live_process_run_ids: Vec<String>,
+    pub local_thread_ids: Vec<String>,
+    pub native_thread_ids: Vec<String>,
+    pub thread_inventory_error: Option<String>,
+}
+
 impl RunManager {
     pub async fn account(&self) -> Result<Value, String> {
         self.app_server.account().await
@@ -212,11 +296,76 @@ impl RunManager {
             }),
         })
     }
+
+    pub async fn reconcile_after_restart(&self) -> RunnerRecoveryReport {
+        let recovered_at = now();
+        let mut interrupted_run_ids = Vec::new();
+        {
+            let mut state = self.state.write().await;
+            for run in &mut state.runs {
+                if matches!(run.status.as_str(), "queued" | "running") {
+                    interrupted_run_ids.push(run.id.clone());
+                    run.status = "failed".into();
+                    run.finished_at = Some(recovered_at.clone());
+                    run.return_code = None;
+                    run.error = Some(
+                        "Golazo restarted before this run reached a durable terminal state".into(),
+                    );
+                }
+            }
+        }
+        interrupted_run_ids.sort();
+        if !interrupted_run_ids.is_empty() {
+            self.save().await;
+        }
+
+        let mut local_thread_ids = self
+            .list_threads()
+            .await
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect::<Vec<_>>();
+        local_thread_ids.sort();
+        local_thread_ids.dedup();
+
+        let mut native_thread_ids = Vec::new();
+        let mut cursor = None;
+        let mut thread_inventory_error = None;
+        for _ in 0..100 {
+            match self.app_server_threads(cursor.clone(), Some(100)).await {
+                Ok(page) => {
+                    native_thread_ids.extend(page.data.into_iter().map(|thread| thread.id));
+                    let next = page.next_cursor;
+                    if next.is_none() || next == cursor {
+                        break;
+                    }
+                    cursor = next;
+                }
+                Err(error) => {
+                    thread_inventory_error = Some(error);
+                    break;
+                }
+            }
+        }
+        native_thread_ids.sort();
+        native_thread_ids.dedup();
+        RunnerRecoveryReport {
+            interrupted_run_ids,
+            live_process_run_ids: vec![],
+            local_thread_ids,
+            native_thread_ids,
+            thread_inventory_error,
+        }
+    }
     async fn load_history(path: &Path) -> Vec<Run> {
         let Ok(text) = tokio::fs::read_to_string(path).await else {
             return vec![];
         };
-        serde_json::from_str(&text).unwrap_or_default()
+        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+            return vec![];
+        };
+        redact_sensitive_value(&mut value);
+        serde_json::from_value(value).unwrap_or_default()
     }
     async fn save(&self) {
         let (path, runs) = {
@@ -226,7 +375,11 @@ impl RunManager {
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        if let Ok(bytes) = serde_json::to_vec_pretty(&runs) {
+        let bytes = serde_json::to_value(&runs).and_then(|mut value| {
+            redact_sensitive_value(&mut value);
+            serde_json::to_vec_pretty(&value)
+        });
+        if let Ok(bytes) = bytes {
             let temporary = path.with_extension("tmp");
             if tokio::fs::write(&temporary, bytes).await.is_ok() {
                 let _ = tokio::fs::rename(temporary, path).await;
@@ -237,7 +390,11 @@ impl RunManager {
         let Ok(text) = tokio::fs::read_to_string(path).await else {
             return ThreadSettings::default();
         };
-        serde_json::from_str(&text).unwrap_or_default()
+        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+            return ThreadSettings::default();
+        };
+        redact_sensitive_value(&mut value);
+        serde_json::from_value(value).unwrap_or_default()
     }
     async fn load_settings(&self) -> ThreadSettings {
         let path = self.state.read().await.settings_path.clone();
@@ -249,7 +406,9 @@ impl RunManager {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         let mut temporary =
             tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
-        serde_json::to_writer_pretty(&mut temporary, settings)
+        let mut durable = serde_json::to_value(settings).map_err(|error| error.to_string())?;
+        redact_sensitive_value(&mut durable);
+        serde_json::to_writer_pretty(&mut temporary, &durable)
             .map_err(|error| error.to_string())?;
         temporary
             .write_all(b"\n")
@@ -270,6 +429,22 @@ impl RunManager {
             .threads
             .get(id)
             .map(|thread| thread.work_mode.clone())
+    }
+    pub async fn thread_goal_id(&self, id: &str) -> Option<String> {
+        if let Some(goal_id) = self
+            .load_settings()
+            .await
+            .threads
+            .get(id)
+            .and_then(|thread| thread.goal_id.clone())
+        {
+            return Some(goal_id);
+        }
+        self.list_threads()
+            .await
+            .into_iter()
+            .find(|thread| thread.id == id)
+            .and_then(|thread| thread.goal_id)
     }
     pub async fn set_default_llm_config(&self, config: LLMConfig) -> Result<LLMConfig, String> {
         let mut settings = self.load_settings().await;
@@ -341,7 +516,9 @@ impl RunManager {
             return Ok(None);
         }
         if let Some(value) = title.as_deref() {
-            self.app_server.set_thread_name(id, value.trim()).await?;
+            self.app_server
+                .set_thread_name(id, &redact_environment_credentials_text(value.trim()))
+                .await?;
         }
         let mut settings = self.load_settings().await;
         let default = settings.default_llm_config.clone();
@@ -357,7 +534,7 @@ impl RunManager {
                 updated_at: now(),
             });
         if let Some(value) = title {
-            record.title = value.trim().into();
+            record.title = redact_environment_credentials_text(value.trim());
         }
         if let Some(mut value) = llm_config {
             value.provider = record.llm_config.provider.clone();
@@ -373,6 +550,53 @@ impl RunManager {
             .await
             .into_iter()
             .find(|thread| thread.id == id))
+    }
+    pub async fn continue_thread_in_mode(
+        &self,
+        id: &str,
+        work_mode: WorkMode,
+        developer_instructions: &str,
+    ) -> Result<Option<ThreadSummary>, String> {
+        let source = self
+            .list_threads()
+            .await
+            .into_iter()
+            .find(|thread| thread.id == id);
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        if source.work_mode == work_mode {
+            return Ok(Some(source));
+        }
+
+        let workspace = self.workspace_root().await;
+        let continued_id = self
+            .app_server
+            .fork_thread(&workspace, id, developer_instructions, &source.llm_config)
+            .await?;
+        self.app_server
+            .set_thread_name(&continued_id, &source.title)
+            .await?;
+
+        let timestamp = now();
+        let mut settings = self.load_settings().await;
+        settings.threads.insert(
+            continued_id.clone(),
+            StoredThread {
+                title: source.title,
+                llm_config: source.llm_config,
+                goal_id: source.goal_id,
+                work_mode,
+                created_at: timestamp.clone(),
+                updated_at: timestamp,
+            },
+        );
+        self.save_settings(&settings).await?;
+        Ok(self
+            .list_threads()
+            .await
+            .into_iter()
+            .find(|thread| thread.id == continued_id))
     }
     pub async fn list_threads(&self) -> Vec<ThreadSummary> {
         let settings = self.load_settings().await;
@@ -391,17 +615,7 @@ impl RunManager {
             let last = grouped.last().copied();
             let title = record
                 .map(|item| item.title.clone())
-                .or_else(|| {
-                    first.map(|run| {
-                        run.prompt
-                            .split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                            .chars()
-                            .take(80)
-                            .collect()
-                    })
-                })
+                .or_else(|| first.map(|run| prompt_title(&run.prompt)))
                 .unwrap_or_else(|| "Untitled thread".into());
             let llm_config = record
                 .map(|item| item.llm_config.clone())
@@ -465,6 +679,7 @@ impl RunManager {
         record.updated_at = timestamp;
         self.save_settings(&settings).await?;
         thread.goal_id = Some(goal_id);
+        redact_app_server_thread(&mut thread);
         Ok(thread)
     }
     pub async fn workspace_root(&self) -> PathBuf {
@@ -532,6 +747,7 @@ impl RunManager {
                         .find(|run| run.thread_id.as_deref() == Some(&thread.id))
                         .and_then(|run| run.goal_id.clone())
                 });
+            redact_app_server_thread(thread);
         }
         if settings_changed {
             self.save_settings(&settings).await?;
@@ -558,6 +774,7 @@ impl RunManager {
             .get(id)
             .and_then(|record| record.goal_id.clone())
             .or(run_goal_id);
+        redact_app_server_thread(&mut thread);
         Ok(thread)
     }
     pub fn app_server_events(
@@ -700,6 +917,84 @@ impl RunManager {
         }
         Ok(candidate)
     }
+
+    async fn prepare_worker_credential_isolation(
+        &self,
+        worker: &Worker,
+    ) -> Result<WorkerCredentialIsolation, String> {
+        let worker_id = worker.id.as_str();
+        if worker_id.is_empty()
+            || !worker_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        {
+            return Err("worker identity is unsafe for credential-isolation paths".into());
+        }
+        let runtime_root = {
+            let state = self.state.read().await;
+            state
+                .history_path
+                .parent()
+                .ok_or_else(|| "run history has no parent directory".to_string())?
+                .join("worker-runtime")
+                .join(worker_id)
+        };
+        let home_directory = runtime_root.join("home");
+        let temporary_directory = runtime_root.join("tmp");
+        tokio::fs::create_dir_all(&home_directory)
+            .await
+            .map_err(|error| format!("could not create isolated worker home: {error}"))?;
+        tokio::fs::create_dir_all(&temporary_directory)
+            .await
+            .map_err(|error| {
+                format!("could not create isolated worker temporary directory: {error}")
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let private = fs::Permissions::from_mode(0o700);
+            fs::set_permissions(&runtime_root, private.clone())
+                .map_err(|error| format!("could not secure worker runtime directory: {error}"))?;
+            fs::set_permissions(&home_directory, private.clone())
+                .map_err(|error| format!("could not secure isolated worker home: {error}"))?;
+            fs::set_permissions(&temporary_directory, private)
+                .map_err(|error| format!("could not secure worker temporary directory: {error}"))?;
+        }
+        let home = home_directory.to_string_lossy().into_owned();
+        let temporary = temporary_directory.to_string_lossy().into_owned();
+        let mut environment: BTreeMap<String, String> = BTreeMap::new();
+        environment.insert("CI".into(), "1".into());
+        environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+        environment.insert("HOME".into(), home.clone());
+        environment.insert("LOGNAME".into(), "golazo-worker".into());
+        environment.insert(
+            "PATH".into(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+        );
+        environment.insert("SHELL".into(), "/bin/sh".into());
+        environment.insert("TEMP".into(), temporary.clone());
+        environment.insert("TMP".into(), temporary.clone());
+        environment.insert("TMPDIR".into(), temporary.clone());
+        environment.insert("USER".into(), "golazo-worker".into());
+        for name in ["LANG", "LC_ALL", "LC_CTYPE", "TERM"] {
+            if let Ok(value) = std::env::var(name) {
+                environment.insert(name.into(), value);
+            }
+        }
+        debug_assert!(
+            environment
+                .keys()
+                .all(|name| !crate::coordination::security::is_sensitive_environment_name(name))
+        );
+        Ok(WorkerCredentialIsolation {
+            worker_id: worker_id.into(),
+            home_directory: home,
+            temporary_directory: temporary,
+            inherited_environment: "none".into(),
+            environment,
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         self: &Arc<Self>,
         prompt: String,
@@ -717,12 +1012,138 @@ impl RunManager {
         work_mode: WorkMode,
         llm_config: Option<LLMConfig>,
     ) -> Result<Run, String> {
+        self.create_scoped(
+            prompt,
+            image_inputs,
+            file_inputs,
+            working_directory,
+            sandbox,
+            approval_policy,
+            approvals_reviewer,
+            ephemeral_thread,
+            goal_id,
+            thread_id,
+            execution_prompt,
+            output_schema,
+            work_mode,
+            llm_config,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_for_worker(
+        self: &Arc<Self>,
+        worker: &Worker,
+        prompt: String,
+        image_inputs: Vec<ImageAttachmentCreate>,
+        file_inputs: Vec<FileAttachmentCreate>,
+        working_directory: String,
+        ephemeral_thread: bool,
+        thread_id: Option<String>,
+        execution_prompt: Option<String>,
+        output_schema: Option<Value>,
+        work_mode: WorkMode,
+        llm_config: Option<LLMConfig>,
+    ) -> Result<Run, String> {
+        let workspace = worker
+            .workspace
+            .as_ref()
+            .ok_or_else(|| "worker has no isolated workspace".to_string())?;
+        let permissions = worker
+            .permission_profile
+            .as_ref()
+            .ok_or_else(|| "worker has no permission profile".to_string())?;
+        validate_permissions(
+            &permissions.sandbox,
+            &permissions.approval_policy,
+            &permissions.approvals_reviewer,
+        )?;
+        crate::coordination::pool::validate_worker_permissions(permissions)
+            .map_err(|error| error.to_string())?;
+        if permissions.sandbox == "danger-full-access" || permissions.network_access {
+            return Err(
+                "autonomous workers must use a bounded filesystem sandbox with network disabled"
+                    .into(),
+            );
+        }
+        if !permissions
+            .tool_capabilities
+            .contains(&WorkerToolCapability::ReadFiles)
+            || !permissions
+                .tool_capabilities
+                .contains(&WorkerToolCapability::RunCommands)
+        {
+            return Err(
+                "worker permission profile does not allow the Codex execution tools".into(),
+            );
+        }
+        if work_mode == WorkMode::Build
+            && !permissions
+                .tool_capabilities
+                .contains(&WorkerToolCapability::WriteFiles)
+        {
+            return Err("build-mode worker does not have file-write capability".into());
+        }
+        let boundary = PathBuf::from(&workspace.worktree_path)
+            .canonicalize()
+            .map_err(|_| "worker workspace does not exist".to_string())?;
+        if boundary.to_string_lossy() != workspace.worktree_path {
+            return Err("worker workspace binding is not canonical".into());
+        }
+        let credential_isolation = self.prepare_worker_credential_isolation(worker).await?;
+        self.create_scoped(
+            prompt,
+            image_inputs,
+            file_inputs,
+            working_directory,
+            permissions.sandbox.clone(),
+            permissions.approval_policy.clone(),
+            permissions.approvals_reviewer.clone(),
+            ephemeral_thread,
+            Some(worker.goal_id.clone()),
+            thread_id,
+            execution_prompt,
+            output_schema,
+            work_mode,
+            llm_config,
+            Some(boundary),
+            Some(credential_isolation),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_scoped(
+        self: &Arc<Self>,
+        prompt: String,
+        image_inputs: Vec<ImageAttachmentCreate>,
+        file_inputs: Vec<FileAttachmentCreate>,
+        working_directory: String,
+        sandbox: String,
+        approval_policy: String,
+        approvals_reviewer: String,
+        ephemeral_thread: bool,
+        goal_id: Option<String>,
+        thread_id: Option<String>,
+        execution_prompt: Option<String>,
+        output_schema: Option<Value>,
+        work_mode: WorkMode,
+        llm_config: Option<LLMConfig>,
+        workspace_boundary: Option<PathBuf>,
+        credential_isolation: Option<WorkerCredentialIsolation>,
+    ) -> Result<Run, String> {
         validate_permissions(&sandbox, &approval_policy, &approvals_reviewer)?;
         let (root, executable) = {
             let state = self.state.read().await;
             (state.workspace_root.clone(), state.executable.clone())
         };
-        let cwd = Self::resolve_cwd(&root, &working_directory)?;
+        let cwd = Self::resolve_cwd(
+            workspace_boundary.as_deref().unwrap_or(&root),
+            &working_directory,
+        )?;
         let effective_config = if let Some(thread_id) = thread_id.as_deref() {
             let thread = self
                 .list_threads()
@@ -759,8 +1180,7 @@ impl RunManager {
                 .map(|file| format!("- {} ({})", file.path, file.name))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let file_context =
-                format!("The user uploaded these files. Inspect them as needed:\n{file_list}");
+            let file_context = crate::prompts::file_attachments(&file_list);
             Some(match execution_prompt {
                 Some(context) if !context.trim().is_empty() => {
                     format!("{context}\n\n{file_context}")
@@ -778,6 +1198,7 @@ impl RunManager {
             approval_policy,
             approvals_reviewer,
             ephemeral_thread,
+            credential_isolation,
             execution_prompt,
             output_schema,
             goal_id,
@@ -795,6 +1216,7 @@ impl RunManager {
             usage: Usage::default(),
             events: vec![],
         };
+        run_correlation(&run).emit_info("run.queued", "queued");
         {
             self.state.write().await.runs.push(run.clone());
         }
@@ -956,6 +1378,10 @@ impl RunManager {
             return;
         };
         let mut events = self.app_server.subscribe();
+        let environment_config = current
+            .credential_isolation
+            .as_ref()
+            .map(worker_shell_environment_config);
         let started = self
             .app_server
             .start_turn(
@@ -970,6 +1396,7 @@ impl RunManager {
                 &current.approvals_reviewer,
                 &current.llm_config,
                 current.ephemeral_thread,
+                environment_config.as_ref(),
             )
             .await;
         let started = match started {
@@ -985,6 +1412,9 @@ impl RunManager {
         let mut agent_message_phases = HashMap::new();
         self.mutate(&id, |run| run.thread_id = Some(thread_id.clone()))
             .await;
+        run_correlation(&current)
+            .with_thread(&thread_id)
+            .emit_info("thread.turn.started", "running");
         if !current.ephemeral_thread {
             self.ensure_thread(
                 &thread_id,
@@ -1039,9 +1469,11 @@ impl RunManager {
                     .and_then(Value::as_str)
                     .and_then(|item_id| agent_message_phases.get(item_id))
                     .is_some_and(|phase| phase == "final_answer");
+            let mut durable_params = event.params.clone();
+            redact_environment_credentials(&mut durable_params);
             self.mutate(&id, |run| {
                 run.events
-                    .push(serde_json::json!({"method": event.method, "params": event.params}));
+                    .push(serde_json::json!({"method": event.method, "params": durable_params}));
                 if run.events.len() > 1000 {
                     run.events.remove(0);
                 }
@@ -1050,7 +1482,7 @@ impl RunManager {
                 {
                     run.final_message
                         .get_or_insert_with(String::new)
-                        .push_str(delta);
+                        .push_str(&redact_environment_credentials_text(delta));
                 }
                 if event.method == "thread/tokenUsage/updated"
                     && let Some(last) = event.params.pointer("/tokenUsage/last")
@@ -1093,6 +1525,9 @@ impl RunManager {
                     }
                 })
                 .await;
+                run_correlation(&current)
+                    .with_thread(&thread_id)
+                    .emit_info("thread.turn.finished", status);
                 self.save().await;
                 return;
             }
@@ -1103,6 +1538,9 @@ impl RunManager {
             run.finished_at = Some(now());
         })
         .await;
+        run_correlation(&current)
+            .with_thread(&thread_id)
+            .emit_warn("thread.turn.finished", "event_stream_disconnected");
         self.save().await;
     }
     async fn execute(self: Arc<Self>, id: String, executable: String) {
@@ -1123,10 +1561,14 @@ impl RunManager {
         let Some(run) = current else {
             return;
         };
+        run_correlation(&run).emit_info("run.started", "running");
         let cwd = PathBuf::from(&run.cwd);
         let skip_git = !cwd.ancestors().any(|parent| parent.join(".git").exists());
         let prompt = run.prompt.clone();
         let mut args = codex_exec_args(&run.sandbox, &run.approval_policy, &run.approvals_reviewer);
+        if let Some(policy) = &run.credential_isolation {
+            append_worker_shell_environment_args(&mut args, policy);
+        }
         if let Some(instructions) = run.execution_prompt.as_deref() {
             args.extend([
                 "--config".into(),
@@ -1218,6 +1660,7 @@ impl RunManager {
                     run.finished_at = Some(now());
                 })
                 .await;
+                run_correlation(&run).emit_warn("run.finished", "spawn_failed");
                 self.save().await;
                 return;
             }
@@ -1232,8 +1675,9 @@ impl RunManager {
         let stdout = child.stdout.take().unwrap();
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let event: Value = serde_json::from_str(&line)
+            let mut event: Value = serde_json::from_str(&line)
                 .unwrap_or_else(|_| serde_json::json!({"type":"unparsed","text":line}));
+            redact_environment_credentials(&mut event);
             let started_thread = if event["type"] == "thread.started" {
                 event["thread_id"].as_str().map(str::to_string)
             } else {
@@ -1266,6 +1710,9 @@ impl RunManager {
             if let Some(thread) = started_thread
                 && !run.ephemeral_thread
             {
+                run_correlation(&run)
+                    .with_thread(&thread)
+                    .emit_info("thread.started", "running");
                 self.ensure_thread(
                     &thread,
                     &run.prompt,
@@ -1288,7 +1735,8 @@ impl RunManager {
                 Ok(status) => {
                     run.status = "failed".into();
                     run.return_code = status.code();
-                    let message = String::from_utf8_lossy(&stderr);
+                    let message =
+                        redact_environment_credentials_text(&String::from_utf8_lossy(&stderr));
                     run.error = Some(if message.is_empty() {
                         "Codex exited with an error".into()
                     } else {
@@ -1309,6 +1757,14 @@ impl RunManager {
             }
         })
         .await;
+        if let Some(completed) = self.get(&id).await {
+            let outcome = completed.status.clone();
+            if outcome == "completed" {
+                run_correlation(&completed).emit_info("run.finished", &outcome);
+            } else {
+                run_correlation(&completed).emit_warn("run.finished", &outcome);
+            }
+        }
         self.save().await;
     }
     pub async fn get(&self, id: &str) -> Option<Run> {
@@ -1322,6 +1778,9 @@ impl RunManager {
     }
     pub async fn list(&self) -> Vec<Run> {
         self.state.read().await.runs.iter().rev().cloned().collect()
+    }
+    pub fn redacted_for_display(run: &Run) -> Run {
+        redacted_copy(run).expect("Run always supports JSON redaction round-trip")
     }
     pub async fn usage(&self) -> Value {
         let state = self.state.read().await;
@@ -1391,6 +1850,7 @@ impl RunManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination::domain::{WorkerPermissionProfile, WorkspaceBinding};
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1419,6 +1879,194 @@ mod tests {
                 "approvals_reviewer=\"user\"",
             ]
         );
+    }
+
+    #[test]
+    fn worker_shell_environment_is_explicit_and_non_inheriting() {
+        let policy = WorkerCredentialIsolation {
+            worker_id: "worker-a".into(),
+            home_directory: "/runtime/worker-a/home".into(),
+            temporary_directory: "/runtime/worker-a/tmp".into(),
+            inherited_environment: "none".into(),
+            environment: BTreeMap::from([
+                ("HOME".into(), "/runtime/worker-a/home".into()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("TMPDIR".into(), "/runtime/worker-a/tmp".into()),
+            ]),
+        };
+        let config = worker_shell_environment_config(&policy);
+        assert_eq!(
+            config.pointer("/shell_environment_policy/inherit"),
+            Some(&Value::String("none".into()))
+        );
+        assert_eq!(
+            config.pointer("/shell_environment_policy/set/HOME"),
+            Some(&Value::String("/runtime/worker-a/home".into()))
+        );
+        assert!(config.to_string().find("OPENAI_API_KEY").is_none());
+
+        let mut args = Vec::new();
+        append_worker_shell_environment_args(&mut args, &policy);
+        assert!(
+            args.iter()
+                .any(|argument| argument == "shell_environment_policy.inherit=\"none\"")
+        );
+        assert!(args.iter().any(|argument| {
+            argument == "shell_environment_policy.set.HOME=\"/runtime/worker-a/home\""
+        }));
+        assert!(!args.iter().any(|argument| argument.contains("API_KEY")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_runs_are_rooted_in_the_bound_worktree_and_use_worker_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let worktree = temp.path().join("worktree");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&worktree).unwrap();
+        let executable = temp.path().join("fake-codex");
+        fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let manager = RunManager::new(
+            project.clone(),
+            executable.to_string_lossy().into(),
+            project.join(".goal-manager/run-history.json"),
+        )
+        .await;
+        let now = Utc::now();
+        let mut worker = Worker::new("goal-a", now);
+        let canonical_project = project.canonicalize().unwrap();
+        let canonical_worktree = worktree.canonicalize().unwrap();
+        worker.workspace = Some(WorkspaceBinding {
+            repository_id: "repo-a".into(),
+            canonical_repository_path: canonical_project.display().to_string(),
+            worktree_path: canonical_worktree.display().to_string(),
+            branch: "codex/golazo/goal-a/worker-a".into(),
+            base_revision: "abc123".into(),
+            created_at: Some(now),
+            creation_evidence: vec!["test fixture".into()],
+        });
+        worker.permission_profile = Some(WorkerPermissionProfile::default());
+
+        let run = manager
+            .create_for_worker(
+                &worker,
+                "worker task".into(),
+                vec![],
+                vec![],
+                ".".into(),
+                true,
+                None,
+                None,
+                None,
+                WorkMode::Build,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(Path::new(&run.cwd), canonical_worktree);
+        assert_eq!(run.sandbox, "workspace-write");
+        assert_eq!(run.approval_policy, "on-request");
+        assert_eq!(run.goal_id.as_deref(), Some("goal-a"));
+        let isolation = run.credential_isolation.as_ref().unwrap();
+        assert_eq!(isolation.worker_id, worker.id.as_str());
+        assert_eq!(isolation.inherited_environment, "none");
+        assert_eq!(
+            isolation.environment.get("HOME"),
+            Some(&isolation.home_directory)
+        );
+        assert_eq!(
+            isolation.environment.get("TMPDIR"),
+            Some(&isolation.temporary_directory)
+        );
+        assert!(Path::new(&isolation.home_directory).is_dir());
+        assert!(Path::new(&isolation.temporary_directory).is_dir());
+        assert!(
+            isolation.environment.keys().all(|name| {
+                !crate::coordination::security::is_sensitive_environment_name(name)
+            })
+        );
+        assert_eq!(
+            fs::metadata(&isolation.home_directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let second_worker = Worker::new("goal-a", now);
+        let second_isolation = manager
+            .prepare_worker_credential_isolation(&second_worker)
+            .await
+            .unwrap();
+        assert_ne!(isolation.home_directory, second_isolation.home_directory);
+        assert_ne!(
+            isolation.temporary_directory,
+            second_isolation.temporary_directory
+        );
+        assert!(
+            manager
+                .create_for_worker(
+                    &worker,
+                    "escape".into(),
+                    vec![],
+                    vec![],
+                    "../project".into(),
+                    true,
+                    None,
+                    None,
+                    None,
+                    WorkMode::Build,
+                    None,
+                )
+                .await
+                .is_err()
+        );
+
+        worker.permission_profile.as_mut().unwrap().network_access = true;
+        assert!(
+            manager
+                .create_for_worker(
+                    &worker,
+                    "network".into(),
+                    vec![],
+                    vec![],
+                    ".".into(),
+                    true,
+                    None,
+                    None,
+                    None,
+                    WorkMode::Build,
+                    None,
+                )
+                .await
+                .is_err()
+        );
+
+        let permissions = worker.permission_profile.as_mut().unwrap();
+        permissions.network_access = false;
+        permissions
+            .tool_capabilities
+            .retain(|capability| *capability != WorkerToolCapability::WriteFiles);
+        let error = manager
+            .create_for_worker(
+                &worker,
+                "write without capability".into(),
+                vec![],
+                vec![],
+                ".".into(),
+                true,
+                None,
+                None,
+                None,
+                WorkMode::Build,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("file-write capability"));
     }
 
     #[tokio::test]
@@ -1521,6 +2169,57 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn mode_changes_continue_in_a_forked_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let executable = temp.path().join("fake-codex");
+        let capture = temp.path().join("fork-request.json");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' '{{\"id\":1,\"result\":{{}}}}'\nIFS= read -r line\nIFS= read -r line\nprintf '%s\\n' \"$line\" > '{}'\nprintf '%s\\n' '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-build\"}}}}}}'\nIFS= read -r line\nprintf '%s\\n' '{{\"id\":3,\"result\":{{}}}}'\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let settings_path = temp.path().join("thread-settings.json");
+        let manager = RunManager::new(
+            workspace,
+            executable.to_string_lossy().to_string(),
+            temp.path().join("run-history.json"),
+        )
+        .await;
+        manager
+            .ensure_thread(
+                "thread-spec",
+                "Define the implementation",
+                &LLMConfig::default(),
+                Some("goal-1"),
+                &WorkMode::Spec,
+            )
+            .await;
+
+        let continued = manager
+            .continue_thread_in_mode("thread-spec", WorkMode::Build, "Build mode guidance")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(continued.id, "thread-build");
+        assert_eq!(continued.goal_id.as_deref(), Some("goal-1"));
+        assert_eq!(continued.work_mode, WorkMode::Build);
+        let stored: Value =
+            serde_json::from_str(&fs::read_to_string(settings_path).unwrap()).unwrap();
+        assert_eq!(stored["threads"]["thread-spec"]["work_mode"], "spec");
+        assert_eq!(stored["threads"]["thread-build"]["work_mode"], "build");
+        let request: Value = serde_json::from_str(&fs::read_to_string(capture).unwrap()).unwrap();
+        assert_eq!(request["method"], "thread/fork");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn reconciles_native_codex_thread_metadata_into_local_settings() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
@@ -1578,7 +2277,7 @@ mod tests {
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"thread-123\"}}'\nprintf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"completed\"}}}}'\nprintf '%s\\n' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":10,\"cached_input_tokens\":4,\"output_tokens\":3,\"reasoning_output_tokens\":1}}}}'\n",
+                "#!/bin/sh\nif [ \"$1\" != \"app-server\" ]; then\n  printf '%s\\n' \"$@\" > '{}'\nfi\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"thread-123\"}}'\nprintf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"completed\"}}}}'\nprintf '%s\\n' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":10,\"cached_input_tokens\":4,\"output_tokens\":3,\"reasoning_output_tokens\":1}}}}'\n",
                 args_capture.display()
             ),
         )
@@ -1756,5 +2455,116 @@ printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-123","tur
         assert_eq!(completed.status, "completed");
         assert_eq!(completed.final_message.as_deref(), Some("\"\""));
         assert_eq!(completed.events.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn redacts_run_history_and_display_projection_without_mutating_live_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = temp.path().join("runs.json");
+        let manager = RunManager::new(temp.path().into(), "codex".into(), history.clone()).await;
+        let run = Run {
+            id: "run-redaction".into(),
+            prompt: "Use OPENAI_API_KEY=sk-prompt-history-secret".into(),
+            images: Vec::new(),
+            files: Vec::new(),
+            cwd: temp.path().to_string_lossy().into_owned(),
+            sandbox: "read-only".into(),
+            approval_policy: "on-request".into(),
+            approvals_reviewer: "user".into(),
+            ephemeral_thread: false,
+            credential_isolation: None,
+            execution_prompt: Some("Authorization: Bearer execution-history-secret".into()),
+            output_schema: None,
+            goal_id: Some("goal-a".into()),
+            resumed_from: None,
+            status: "completed".into(),
+            created_at: now(),
+            started_at: Some(now()),
+            finished_at: Some(now()),
+            return_code: Some(0),
+            thread_id: Some("thread-a".into()),
+            work_mode: WorkMode::Spec,
+            llm_config: LLMConfig::default(),
+            final_message: Some("password=final-message-secret".into()),
+            error: None,
+            usage: Usage::default(),
+            events: vec![serde_json::json!({
+                "diff": "+ api_key: event-diff-secret",
+                "safe": "visible"
+            })],
+        };
+        manager.state.write().await.runs.push(run.clone());
+        manager.save().await;
+
+        assert!(
+            manager
+                .get("run-redaction")
+                .await
+                .unwrap()
+                .prompt
+                .contains("prompt-history-secret"),
+            "live execution state must keep the original prompt"
+        );
+        let display = RunManager::redacted_for_display(&run);
+        let display = serde_json::to_string(&display).unwrap();
+        let durable = std::fs::read_to_string(&history).unwrap();
+        for secret in [
+            "prompt-history-secret",
+            "execution-history-secret",
+            "final-message-secret",
+            "event-diff-secret",
+        ] {
+            assert!(!display.contains(secret));
+            assert!(!durable.contains(secret));
+        }
+        assert!(display.contains("visible"));
+        assert!(durable.contains("visible"));
+
+        manager
+            .ensure_thread(
+                "thread-redaction",
+                "OPENAI_API_KEY=thread-title-secret",
+                &LLMConfig::default(),
+                Some("goal-a"),
+                &WorkMode::Spec,
+            )
+            .await;
+        let settings = std::fs::read_to_string(temp.path().join("thread-settings.json")).unwrap();
+        assert!(!settings.contains("thread-title-secret"));
+        assert!(
+            manager
+                .list_threads()
+                .await
+                .iter()
+                .all(|thread| !thread.title.contains("thread-title-secret"))
+        );
+
+        let mut native_thread = AppServerThread {
+            id: "native-redaction".into(),
+            cwd: temp.path().to_string_lossy().into_owned(),
+            preview: "password=native-preview-secret".into(),
+            name: Some("Authorization: Bearer native-name-secret".into()),
+            created_at: 0,
+            updated_at: 0,
+            model_provider: "openai".into(),
+            source: serde_json::json!({"apiKey": "native-source-secret"}),
+            status: serde_json::json!({"message": "safe"}),
+            turns: vec![serde_json::json!({"prompt": "token=turn-secret"})],
+            goal_id: Some("goal-a".into()),
+        };
+        redact_app_server_thread(&mut native_thread);
+        let native_thread = serde_json::to_string(&native_thread).unwrap();
+        for secret in [
+            "native-preview-secret",
+            "native-name-secret",
+            "native-source-secret",
+            "turn-secret",
+        ] {
+            assert!(!native_thread.contains(secret));
+        }
+
+        let reloaded = RunManager::new(temp.path().into(), "codex".into(), history).await;
+        let reloaded = serde_json::to_string(&reloaded.list().await).unwrap();
+        assert!(!reloaded.contains("prompt-history-secret"));
     }
 }
