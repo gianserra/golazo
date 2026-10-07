@@ -3,10 +3,7 @@ use super::domain::{WorkerId, WorkspaceBinding};
 use super::pool::{
     PoolRecoveryReport, RuntimeInventory, WorkerPoolError, WorkerPoolPolicy, WorkerPoolService,
 };
-use super::store::{
-    ClaimRepository, IntegrationArtifactRepository, IntegrationJobRepository, PoolRepository,
-    SqliteCoordinationStore, StoreError, WorkerRepository,
-};
+use super::store::{PoolRepository, SqliteCoordinationStore, StoreError, WorkerRepository};
 use super::workspace::{WorkspaceQuarantineRecord, WorkspaceReconciliation, WorktreeManager};
 use crate::observability::CorrelationIds;
 use crate::runner::{RunManager, RunnerRecoveryReport};
@@ -326,6 +323,9 @@ mod tests {
     };
     use crate::coordination::integration::IntegrationQueueService;
     use crate::coordination::pool::{GoalPoolState, PoolMode};
+    use crate::coordination::store::{
+        ClaimRepository, IntegrationArtifactRepository, IntegrationJobRepository,
+    };
     use crate::models::Status;
     use serde_json::json;
     use std::process::Command;

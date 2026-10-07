@@ -25,6 +25,9 @@ use crate::coordination::domain::{
     WorkerNotification, WorkerPermissionPolicy, WorkerState, WorkspaceBinding,
 };
 use crate::coordination::escalations::{EscalationLifecycleError, EscalationLifecycleService};
+use crate::coordination::execution::{
+    dispatch_claims, recover_unstarted_claims, resolve_base_revision,
+};
 use crate::coordination::health::{GoalHealthService, HealthError, HealthPolicy};
 use crate::coordination::integration::{
     CaptureIntegrationArtifactRequest, IntegrationArtifactError, IntegrationArtifactService,
@@ -1475,10 +1478,16 @@ async fn command_coordination_pool(
         }
     }
     let root = state.tracker_root.read().await.clone();
-    let claims = ClaimService::new(Tracker::new(root), store.clone(), ClaimPolicy::default());
+    let claims = ClaimService::new(
+        Tracker::new(root.clone()),
+        store.clone(),
+        ClaimPolicy::default(),
+    );
     let workspace = state.runner.workspace_root().await;
     let now = Utc::now();
     let mut assigned = Vec::new();
+    let mut recovered_phantom_claim_ids = Vec::new();
+    let mut should_dispatch = false;
     let mut stop_report = None;
     match body.command {
         PoolCommand::Configure {
@@ -1516,6 +1525,9 @@ async fn command_coordination_pool(
             permission_policy,
             resource_policy,
         } => {
+            recovered_phantom_claim_ids =
+                recover_unstarted_claims(&Tracker::new(root.clone()), store.clone(), &goal_id, now)
+                    .map_err(CoordinationApiError::internal)?;
             let desired_concurrency = desired_concurrency.or_else(|| {
                 current
                     .as_ref()
@@ -1542,29 +1554,44 @@ async fn command_coordination_pool(
                 pool.set_resource_quotas(&goal_id, policy, now)
                     .map_err(coordination_pool_error)?;
             }
+            let base_revision = if claims
+                .ready_unclaimed_scopes(&goal_id)
+                .map_err(coordination_claim_error)?
+                .is_empty()
+            {
+                base_revision.unwrap_or_else(|| "workspace-current".into())
+            } else {
+                resolve_base_revision(&workspace, base_revision.as_deref())
+                    .map_err(CoordinationApiError::invalid)?
+            };
             assigned = pool
-                .fill_ready_claims(
-                    &claims,
-                    &goal_id,
-                    base_revision.as_deref().unwrap_or("workspace-current"),
-                    now,
-                )
+                .fill_ready_claims(&claims, &goal_id, &base_revision, now)
                 .map_err(coordination_pool_error)?;
+            should_dispatch = true;
         }
         PoolCommand::Pause => {
             pool.pause(&goal_id, now).map_err(coordination_pool_error)?;
         }
         PoolCommand::Resume { base_revision } => {
+            recovered_phantom_claim_ids =
+                recover_unstarted_claims(&Tracker::new(root.clone()), store.clone(), &goal_id, now)
+                    .map_err(CoordinationApiError::internal)?;
             pool.resume(&goal_id, 0, now)
                 .map_err(coordination_pool_error)?;
+            let base_revision = if claims
+                .ready_unclaimed_scopes(&goal_id)
+                .map_err(coordination_claim_error)?
+                .is_empty()
+            {
+                base_revision.unwrap_or_else(|| "workspace-current".into())
+            } else {
+                resolve_base_revision(&workspace, base_revision.as_deref())
+                    .map_err(CoordinationApiError::invalid)?
+            };
             assigned = pool
-                .fill_ready_claims(
-                    &claims,
-                    &goal_id,
-                    base_revision.as_deref().unwrap_or("workspace-current"),
-                    now,
-                )
+                .fill_ready_claims(&claims, &goal_id, &base_revision, now)
                 .map_err(coordination_pool_error)?;
+            should_dispatch = true;
         }
         PoolCommand::Drain => {
             pool.drain(&goal_id, now).map_err(coordination_pool_error)?;
@@ -1573,16 +1600,40 @@ async fn command_coordination_pool(
             stop_report = Some(pool.stop(&goal_id, now).map_err(coordination_pool_error)?);
         }
         PoolCommand::Reconcile { base_revision } => {
+            recovered_phantom_claim_ids =
+                recover_unstarted_claims(&Tracker::new(root.clone()), store.clone(), &goal_id, now)
+                    .map_err(CoordinationApiError::internal)?;
+            let base_revision = if claims
+                .ready_unclaimed_scopes(&goal_id)
+                .map_err(coordination_claim_error)?
+                .is_empty()
+            {
+                base_revision.unwrap_or_else(|| "workspace-current".into())
+            } else {
+                resolve_base_revision(&workspace, base_revision.as_deref())
+                    .map_err(CoordinationApiError::invalid)?
+            };
             assigned = pool
-                .fill_ready_claims(
-                    &claims,
-                    &goal_id,
-                    base_revision.as_deref().unwrap_or("workspace-current"),
-                    now,
-                )
+                .fill_ready_claims(&claims, &goal_id, &base_revision, now)
                 .map_err(coordination_pool_error)?;
+            should_dispatch = true;
         }
     }
+    let execution = if should_dispatch && !assigned.is_empty() {
+        Some(
+            dispatch_claims(
+                state.runner.clone(),
+                Tracker::new(root),
+                store.clone(),
+                workspace,
+                assigned.clone(),
+                recovered_phantom_claim_ids,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     let snapshot = pool.snapshot(&goal_id).map_err(coordination_pool_error)?;
     let document = pool_document(
         &goal_id,
@@ -1590,6 +1641,7 @@ async fn command_coordination_pool(
         json!({
             "snapshot": snapshot,
             "assignedClaims": assigned,
+            "execution": execution,
             "stopReport": stop_report,
         }),
         now,
@@ -5085,6 +5137,18 @@ async fn create_run(
     } else {
         None
     };
+    let mut thread_id = body.thread_id.clone();
+    if let (Some(existing_thread_id), Some(instructions)) =
+        (thread_id.as_deref(), execution_prompt.as_deref())
+    {
+        let continued = state
+            .runner
+            .continue_thread_in_mode(existing_thread_id, work_mode.clone(), instructions)
+            .await
+            .map_err(|error| ApiError::new(StatusCode::BAD_GATEWAY, error))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "thread not found"))?;
+        thread_id = Some(continued.id);
+    }
     let run = state
         .runner
         .create(
@@ -5097,7 +5161,7 @@ async fn create_run(
             body.approvals_reviewer,
             false,
             body.goal_id,
-            body.thread_id,
+            thread_id,
             execution_prompt,
             None,
             work_mode,
@@ -5389,23 +5453,20 @@ async fn update_thread(
     }
     let mut target_id = id.clone();
     if let Some(work_mode) = body.work_mode.clone() {
-        let current_mode = state.runner.thread_work_mode(&id).await;
-        if current_mode.as_ref() != Some(&work_mode) {
-            let goal_id = state.runner.thread_goal_id(&id).await.ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::CONFLICT,
-                    "assign this thread to a goal before changing its work mode",
-                )
-            })?;
-            let instructions = goal_execution_prompt(&goal_id, &work_mode);
-            target_id = state
-                .runner
-                .continue_thread_in_mode(&id, work_mode, &instructions)
-                .await
-                .map_err(|error| ApiError::new(StatusCode::BAD_GATEWAY, error))?
-                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "thread not found"))?
-                .id;
-        }
+        let goal_id = state.runner.thread_goal_id(&id).await.ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "assign this thread to a goal before changing its work mode",
+            )
+        })?;
+        let instructions = goal_execution_prompt(&goal_id, &work_mode);
+        target_id = state
+            .runner
+            .continue_thread_in_mode(&id, work_mode, &instructions)
+            .await
+            .map_err(|error| ApiError::new(StatusCode::BAD_GATEWAY, error))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "thread not found"))?
+            .id;
     }
     state
         .runner

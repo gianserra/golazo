@@ -43,6 +43,7 @@ type CoordinationWorker = {
   } | null;
   lastHeartbeatAt?: string | null;
   termination?: { reason?: string } | null;
+  turnHistory?: Array<{ runId: string; threadId: string; completedAt?: string | null }>;
 };
 type ResourceQuotaPolicy = {
   maxWorkerTokens: number;
@@ -281,6 +282,9 @@ type GoalWorkerCardData = {
   validation: "passed" | "failed" | "unknown";
   lastHeartbeatAt: string | null;
   terminationReason: string | null;
+  failureCode: string | null;
+  failureMessage: string | null;
+  recoveryGuidance: string | null;
 };
 type GoalIntegrationArtifactData = {
   resource: CoordinationResource<CoordinationArtifact>;
@@ -311,6 +315,15 @@ type GoalPoolSummary = {
   integrations: GoalIntegrationArtifactData[];
   activity: GoalActivityItem[];
   escalations: GoalEscalationData[];
+};
+type CoordinationGoalHealth = {
+  status: "healthy" | "unknown" | "degraded" | "unhealthy";
+  operatingMode: string;
+  components: Array<{
+    component: string;
+    status: "healthy" | "unknown" | "degraded" | "unhealthy";
+    diagnostics: Array<{ summary: string; entityKind?: string | null; entityId?: string | null }>;
+  }>;
 };
 type GoalType = "Greenfield" | "Feature" | "Bug" | "Refactor" | "Migration" | "Integration" | "Release" | "Research" | "Mixed";
 type SuggestionScope = "required_mvp" | "required_release_safety" | "optional_hardening" | "future";
@@ -358,6 +371,9 @@ type Run = {
   prompt: string;
   images: RunImage[];
   files: RunFile[];
+  sandbox: "workspace-write" | "danger-full-access";
+  approval_policy: "on-request" | "never";
+  approvals_reviewer: "user" | "auto_review";
   goal_id: string | null;
   thread_id: string | null;
   work_mode: WorkMode;
@@ -366,6 +382,12 @@ type Run = {
   created_at: string;
   final_message: string | null;
   error: string | null;
+  terminal_error?: {
+    code?: string | null;
+    message: string;
+    additionalDetails?: string | null;
+    retryable: boolean;
+  } | null;
   usage: Usage;
   events: unknown[];
 };
@@ -557,7 +579,7 @@ function loadExpandedAutonomousGoals(): string[] {
   }
 }
 
-async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     headers: { "content-type": "application/json" },
     ...options,
@@ -566,6 +588,7 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
     const body = await response.json().catch(() => ({}));
     throw new ApiRequestError(response.status, body.detail || body.message || `Request failed (${response.status})`);
   }
+  if (response.status === 204 || response.status === 205) return undefined as T;
   return response.json();
 }
 
@@ -653,6 +676,23 @@ function humanizeCoordinationState(value: string): string {
   return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+function humanizeErrorCode(value: string): string {
+  return value.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function workerRecoveryGuidance(code: string | null, workspacePath: string | null): string {
+  const preserved = workspacePath
+    ? "The isolated workspace and its uncommitted changes are preserved."
+    : "No preserved workspace was reported.";
+  if (code === "usageLimitExceeded") {
+    return `${preserved} Wait for Codex usage to reset or add capacity before recovering this work.`;
+  }
+  if (code === "responseStreamDisconnected") {
+    return `${preserved} Check connectivity, then recover the work instead of restarting the feature from scratch.`;
+  }
+  return `${preserved} Inspect the run and workspace evidence before retrying or discarding the work.`;
+}
+
 function relativeTimestamp(value: string | null): string {
   if (!value) return "Not reported";
   const timestamp = new Date(value).getTime();
@@ -695,8 +735,9 @@ function workerStateTone(state: string): "healthy" | "attention" | "paused" | "i
 
 async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
   const goal = encodeURIComponent(goalId);
-  const [pool, readyWork, claims, packages, workerResources, artifacts, contracts, events, interventions, notifications, escalationResources] = await Promise.all([
+  const [pool, healthSnapshot, readyWork, claims, packages, workerResources, artifacts, contracts, events, interventions, notifications, escalationResources] = await Promise.all([
     optionalApi<CoordinationResource<CoordinationPool>>(`/coordination/v1/goals/${goal}/pool`),
+    optionalApi<CoordinationResource<CoordinationGoalHealth>>(`/coordination/v1/goals/${goal}/health`),
     allCoordinationItems<CoordinationReadyScope>(`/coordination/v1/goals/${goal}/ready-work`),
     allCoordinationItems<CoordinationClaim>(`/coordination/v1/goals/${goal}/claims`),
     allCoordinationItems<CoordinationPackage>(`/coordination/v1/goals/${goal}/packages`),
@@ -771,6 +812,14 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
     );
     return [worker.metadata.id, page.items] as const;
   })));
+  const terminalRunByWorker = new Map(await Promise.all(workerResources
+    .filter((worker) => ["failed", "recovering"].includes(worker.data.state))
+    .map(async (worker) => {
+      const latestTurn = worker.data.turnHistory?.at(-1);
+      const runId = worker.data.currentRunId || latestTurn?.runId || null;
+      const run = runId ? await optionalApi<Run>(`/runs/${encodeURIComponent(runId)}`) : null;
+      return [worker.metadata.id, run] as const;
+    })));
   const workers = workerResources.map((resource): GoalWorkerCardData => {
     const worker = resource.data;
     const claim = (worker.activeClaims || [])
@@ -795,21 +844,29 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
         ? "failed"
         : "unknown";
     const featureId = claim?.data.scope.kind === "feature" ? claim.data.scope.feature_id : null;
+    const latestTurn = worker.turnHistory?.at(-1);
+    const terminalRun = terminalRunByWorker.get(resource.metadata.id) || null;
+    const failureCode = terminalRun?.terminal_error?.code || null;
+    const failureMessage = terminalRun?.terminal_error?.message || terminalRun?.error || null;
+    const workspacePath = worker.workspace?.worktreePath || null;
     return {
       id: resource.metadata.id,
       state: worker.state,
       claimId: claim?.metadata.id || null,
       claimLabel: packageRecord?.title || featureId || (claim ? "Claimed work" : "No active claim"),
       packageLabel: packageRecord?.title || null,
-      runId: worker.currentRunId || null,
-      threadId: worker.currentThreadId || null,
+      runId: worker.currentRunId || latestTurn?.runId || null,
+      threadId: worker.currentThreadId || latestTurn?.threadId || null,
       branch: worker.workspace?.branch || null,
-      workspacePath: worker.workspace?.worktreePath || null,
+      workspacePath,
       activity: coordinationEventSummary(latestActivity),
       activityAt: latestActivity?.occurredAt || null,
       validation,
       lastHeartbeatAt: worker.lastHeartbeatAt || claim?.data.heartbeatAt || null,
       terminationReason: worker.termination?.reason || null,
+      failureCode,
+      failureMessage,
+      recoveryGuidance: failureMessage ? workerRecoveryGuidance(failureCode, workspacePath) : null,
     };
   }).sort((left, right) => {
     const terminal = new Set(["completed", "failed", "cancelled"]);
@@ -974,20 +1031,23 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
     };
   }
 
+  const authoritativeAttention = healthSnapshot
+    ? ["degraded", "unhealthy"].includes(healthSnapshot.data.status)
+    : false;
   const hasUnhealthyWorker = pool.data.workers.some((worker) =>
     ["blocked", "failed", "recovering"].includes(worker.state),
   );
   const belowDesiredWithWork = pool.data.goal.mode === "running"
     && pool.data.activeWorkers < pool.data.goal.desiredConcurrency
     && readyWork.length > 0;
-  const health = hasUnhealthyWorker || blockedWork > 0 || failedIntegrations > 0 || belowDesiredWithWork
+  const health = authoritativeAttention || hasUnhealthyWorker || blockedWork > 0 || failedIntegrations > 0 || belowDesiredWithWork
     ? "attention"
     : pool.data.goal.mode === "running"
       ? "healthy"
       : pool.data.goal.mode === "paused" || pool.data.goal.mode === "draining"
         ? "paused"
         : "inactive";
-  const healthLabel = hasUnhealthyWorker || blockedWork > 0 || failedIntegrations > 0
+  const healthLabel = authoritativeAttention || hasUnhealthyWorker || blockedWork > 0 || failedIntegrations > 0
     ? "Needs attention"
     : belowDesiredWithWork
       ? "Capacity available"
@@ -1652,7 +1712,14 @@ function GoalWorkers({
                     <div><span>Latest activity</span><time title={worker.activityAt || undefined}>{relativeTimestamp(worker.activityAt)}</time></div>
                     <p>{worker.activity}</p>
                   </div>
-                  {worker.terminationReason && (
+                  {worker.failureMessage && (
+                    <div className="worker-failure" role="alert">
+                      <strong>{worker.failureCode ? humanizeErrorCode(worker.failureCode) : "Worker run failed"}</strong>
+                      <p>{worker.failureMessage}</p>
+                      {worker.recoveryGuidance && <small>{worker.recoveryGuidance}</small>}
+                    </div>
+                  )}
+                  {worker.terminationReason && worker.terminationReason !== worker.failureMessage && (
                     <p className="worker-termination"><strong>Termination</strong>{worker.terminationReason}</p>
                   )}
                 </div>
@@ -2813,7 +2880,14 @@ export default function App() {
     if (!threadId) return relevant.filter((run) => !run.resumed_from).slice(0, 1).reverse();
     return relevant.filter((run) => run.thread_id === threadId || run.resumed_from === threadId).reverse();
   }, [freshChat, runs, selectedGoal, threadId]);
-  const busy = modeSwitching || chatRuns.some((run) => run.status === "queued" || run.status === "running");
+  const activeRun = chatRuns.find((run) => run.status === "queued" || run.status === "running") || null;
+  const activePermissionMode: PermissionMode | null = activeRun
+    ? activeRun.approval_policy === "never" || activeRun.sandbox === "danger-full-access"
+      ? "full-access"
+      : activeRun.approvals_reviewer === "auto_review" ? "auto-review" : "ask"
+    : null;
+  const displayedPermission = permissionOptions.find((option) => option.value === activePermissionMode) || selectedPermission;
+  const busy = modeSwitching || Boolean(activeRun);
   const restoredTurns = useMemo(() => restoreLocalUserPrompts(historyTurns(appHistory), chatRuns), [appHistory, chatRuns]);
   const codexLimitSnapshot = useMemo(() => {
     if (!codexRateLimits) return null;
@@ -2901,7 +2975,10 @@ export default function App() {
         }),
       });
       setPrompt(""); setPendingImages([]); setPendingFiles([]); setFreshChat(false);
-      if (!threadId) setPendingRunId(created.id);
+      if (created.thread_id && created.thread_id !== threadId) {
+        setAppHistory(null);
+        setThreadId(created.thread_id);
+      } else if (!threadId) setPendingRunId(created.id);
       await refresh();
     } catch (error) { setToast(error instanceof Error ? error.message : String(error)); }
   }
@@ -3474,13 +3551,15 @@ export default function App() {
                     <div className="permission-picker" ref={permissionsRef}>
                       <button
                         type="button"
-                        className={`permission-trigger ${permissionMode === "full-access" ? "danger" : ""}`}
+                        className={`permission-trigger ${displayedPermission.value === "full-access" ? "danger" : ""}`}
                         onClick={() => { setSettingsOpen(false); setPermissionsOpen((open) => !open); }}
                         aria-expanded={permissionsOpen}
                         aria-controls="permissions-popover"
+                        disabled={Boolean(activeRun)}
+                        title={activeRun ? `${displayedPermission.label} applies to this running turn. Choose permissions for the next turn after it finishes.` : "Choose permissions for the next turn"}
                       >
-                        <PermissionIcon mode={permissionMode} />
-                        <span>{selectedPermission.label}</span>
+                        <PermissionIcon mode={displayedPermission.value} />
+                        <span>{displayedPermission.label}</span>
                         <i className="permission-chevron" aria-hidden="true" />
                       </button>
                       {permissionsOpen && (

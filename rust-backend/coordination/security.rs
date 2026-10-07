@@ -1,5 +1,5 @@
 pub use crate::redaction::{
-    REDACTED_CREDENTIAL, is_sensitive_field_name as is_sensitive_environment_name,
+    is_sensitive_field_name as is_sensitive_environment_name,
     redact_sensitive_text as redact_environment_credentials_text,
     redact_sensitive_value as redact_environment_credentials,
 };
@@ -172,6 +172,7 @@ pub fn goal_quota_violation(policy: &ResourceQuotaPolicy, usage: ResourceUsage) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redaction::REDACTED_CREDENTIAL;
     use serde_json::json;
 
     #[test]
