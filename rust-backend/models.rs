@@ -559,6 +559,18 @@ pub struct WorkerCredentialIsolation {
     pub environment: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunTerminalError {
+    #[serde(default)]
+    pub code: Option<String>,
+    pub message: String,
+    #[serde(default)]
+    pub additional_details: Option<String>,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
     pub id: String,
@@ -594,6 +606,8 @@ pub struct Run {
     pub llm_config: LLMConfig,
     pub final_message: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub terminal_error: Option<RunTerminalError>,
     #[serde(default)]
     pub usage: Usage,
     #[serde(default)]

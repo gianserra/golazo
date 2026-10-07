@@ -10,6 +10,7 @@ import {
   GoalPoolControls,
   GoalPoolSummaryCard,
   GoalWorkers,
+  api,
   loadGoalPoolSummary,
 } from "./App";
 import type {
@@ -63,6 +64,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("API responses", () => {
+  it("accepts an empty 204 approval response without parsing JSON", async () => {
+    const json = vi.fn();
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, status: 204, json }) as unknown as Response));
+
+    await expect(api<void>("/app-server/approvals/approval-1", { method: "POST" })).resolves.toBeUndefined();
+    expect(json).not.toHaveBeenCalled();
+  });
+});
+
 describe("worker dashboard", () => {
   it("keeps autonomous controls collapsed behind a compact status summary", async () => {
     const onToggle = vi.fn();
@@ -103,6 +114,9 @@ describe("worker dashboard", () => {
         validation: "passed",
         lastHeartbeatAt: now,
         terminationReason: null,
+        failureCode: null,
+        failureMessage: null,
+        recoveryGuidance: null,
       },
       {
         id: "worker-stalled-002",
@@ -119,6 +133,9 @@ describe("worker dashboard", () => {
         validation: "failed",
         lastHeartbeatAt: "2026-10-05T14:30:00.000Z",
         terminationReason: "Worker heartbeat expired",
+        failureCode: null,
+        failureMessage: null,
+        recoveryGuidance: null,
       },
     ];
 
@@ -132,6 +149,35 @@ describe("worker dashboard", () => {
     fireEvent.click(cards[1]);
     expect(screen.getByText("Heartbeat lost; workspace quarantined")).toBeTruthy();
     expect(screen.getByText("Worker heartbeat expired")).toBeTruthy();
+  });
+
+  it("shows the concrete Codex failure and preserved-work guidance", () => {
+    const workers: GoalWorkerCardData[] = [{
+      id: "worker-limited-003",
+      state: "failed",
+      claimId: null,
+      claimLabel: "No active claim",
+      packageLabel: null,
+      runId: "run-limited-003",
+      threadId: "thread-limited-003",
+      branch: "golazo/worker-limited-003",
+      workspacePath: "/tmp/worktrees/worker-limited-003",
+      activity: "Run stopped",
+      activityAt: now,
+      validation: "unknown",
+      lastHeartbeatAt: now,
+      terminationReason: "Permanent: worker failed",
+      failureCode: "usageLimitExceeded",
+      failureMessage: "You have reached your Codex usage limit.",
+      recoveryGuidance: "The isolated workspace and its uncommitted changes are preserved. Wait for Codex usage to reset before recovering this work.",
+    }];
+
+    const { container } = render(<GoalWorkers workers={workers} loading={false} error={null} />);
+    fireEvent.click(container.querySelector("summary")!);
+
+    expect(screen.getByText("Usage Limit Exceeded")).toBeTruthy();
+    expect(screen.getByText("You have reached your Codex usage limit.")).toBeTruthy();
+    expect(screen.getByText(/uncommitted changes are preserved/)).toBeTruthy();
   });
 
   it("renders managed overlap evidence inside a claimed feature", () => {
@@ -362,7 +408,9 @@ describe("worker dashboard", () => {
     ]);
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
-      const body = url.includes("/pool")
+      const body = url.includes("/health")
+        ? resource("dashboard", { status: "healthy", operatingMode: "normal", components: [] })
+        : url.includes("/pool")
         ? pool
         : { apiVersion: "v1", items: [...collections.entries()].find(([suffix]) => url.includes(suffix))?.[1] || [], nextCursor: null };
       return { ok: true, json: async () => body } as Response;

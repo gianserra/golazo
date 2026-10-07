@@ -1,7 +1,7 @@
 use super::domain::*;
 use super::store::{
-    ClaimRepository, EscalationRepository, EventRepository, IdempotencyRepository,
-    SqliteCoordinationStore, StoreError, WorkPackageRepository, WorkerRepository,
+    ClaimRepository, EscalationRepository, IdempotencyRepository, SqliteCoordinationStore,
+    StoreError, WorkPackageRepository, WorkerRepository,
 };
 use crate::tracker::{Tracker, TrackerError};
 use chrono::{DateTime, Duration, Utc};
@@ -920,6 +920,7 @@ fn scope_from_ready_item(item: &Value) -> Option<ClaimScope> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination::store::EventRepository;
     use crate::models::{IntegrationScope, Status};
     use std::sync::Barrier;
     use std::thread;

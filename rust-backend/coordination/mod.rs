@@ -12,6 +12,7 @@ pub mod detectors;
 mod disaster_recovery;
 pub mod domain;
 pub mod escalations;
+pub mod execution;
 pub mod health;
 pub mod integration;
 pub mod metrics;
