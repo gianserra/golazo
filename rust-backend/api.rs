@@ -12,6 +12,9 @@ use crate::coordination::claims::{
 use crate::coordination::contracts::{
     ContractRegistration, ContractRegistry, ContractRegistryError,
 };
+use crate::coordination::delivery::{
+    GoalDeliveryState, ensure_goal_base_revision, read_state as read_goal_delivery_state,
+};
 use crate::coordination::domain::{
     Claim, ClaimId, ClaimScope, ClaimState, ContractId, ContractKind, CoordinationActor,
     CoordinationEvent, CoordinationEventPayload, CoordinationSignal, EscalationDecision,
@@ -25,9 +28,7 @@ use crate::coordination::domain::{
     WorkerNotification, WorkerPermissionPolicy, WorkerState, WorkspaceBinding,
 };
 use crate::coordination::escalations::{EscalationLifecycleError, EscalationLifecycleService};
-use crate::coordination::execution::{
-    dispatch_claims, recover_unstarted_claims, resolve_base_revision,
-};
+use crate::coordination::execution::{dispatch_claims, recover_unstarted_claims};
 use crate::coordination::health::{GoalHealthService, HealthError, HealthPolicy};
 use crate::coordination::integration::{
     CaptureIntegrationArtifactRequest, IntegrationArtifactError, IntegrationArtifactService,
@@ -45,6 +46,7 @@ use crate::coordination::protocol::{
     WorkerContextLimits, WorkerProtocolService, WorkerToolError, WorkerToolRequest,
     WorkerToolResponse,
 };
+use crate::coordination::recovery_artifacts::{PartialWorkArtifact, partial_work_for_goal};
 use crate::coordination::security::ResourceQuotaPolicy;
 use crate::coordination::store::{
     ClaimRepository, ContractRepository, EscalationRepository, EventRepository,
@@ -388,6 +390,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/coordination/v1/goals/{goal_id}/ready-work",
             get(list_coordination_ready_work),
+        )
+        .route(
+            "/coordination/v1/goals/{goal_id}/partial-work",
+            get(list_coordination_partial_work),
+        )
+        .route(
+            "/coordination/v1/goals/{goal_id}/delivery",
+            get(get_coordination_goal_delivery),
         )
         .route(
             "/coordination/v1/goals/{goal_id}/packages",
@@ -1561,8 +1571,14 @@ async fn command_coordination_pool(
             {
                 base_revision.unwrap_or_else(|| "workspace-current".into())
             } else {
-                resolve_base_revision(&workspace, base_revision.as_deref())
-                    .map_err(CoordinationApiError::invalid)?
+                ensure_goal_base_revision(
+                    &Tracker::new(root.clone()),
+                    &workspace,
+                    &goal_id,
+                    base_revision.as_deref(),
+                    now,
+                )
+                .map_err(|error| CoordinationApiError::invalid(error.to_string()))?
             };
             assigned = pool
                 .fill_ready_claims(&claims, &goal_id, &base_revision, now)
@@ -1585,8 +1601,14 @@ async fn command_coordination_pool(
             {
                 base_revision.unwrap_or_else(|| "workspace-current".into())
             } else {
-                resolve_base_revision(&workspace, base_revision.as_deref())
-                    .map_err(CoordinationApiError::invalid)?
+                ensure_goal_base_revision(
+                    &Tracker::new(root.clone()),
+                    &workspace,
+                    &goal_id,
+                    base_revision.as_deref(),
+                    now,
+                )
+                .map_err(|error| CoordinationApiError::invalid(error.to_string()))?
             };
             assigned = pool
                 .fill_ready_claims(&claims, &goal_id, &base_revision, now)
@@ -1610,8 +1632,14 @@ async fn command_coordination_pool(
             {
                 base_revision.unwrap_or_else(|| "workspace-current".into())
             } else {
-                resolve_base_revision(&workspace, base_revision.as_deref())
-                    .map_err(CoordinationApiError::invalid)?
+                ensure_goal_base_revision(
+                    &Tracker::new(root.clone()),
+                    &workspace,
+                    &goal_id,
+                    base_revision.as_deref(),
+                    now,
+                )
+                .map_err(|error| CoordinationApiError::invalid(error.to_string()))?
             };
             assigned = pool
                 .fill_ready_claims(&claims, &goal_id, &base_revision, now)
@@ -1969,6 +1997,11 @@ fn coordination_claim_error(error: ClaimServiceError) -> CoordinationApiError {
             },
             false,
         ),
+        ClaimServiceError::RecoveryInventory(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ProblemCode::Internal,
+            true,
+        ),
         ClaimServiceError::Domain(_) => (StatusCode::CONFLICT, ProblemCode::Conflict, false),
         ClaimServiceError::Store(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2071,6 +2104,56 @@ async fn list_coordination_ready_work(
         })
         .collect();
     Ok(Json(CollectionPage::new(items, next)))
+}
+
+async fn list_coordination_partial_work(
+    State(state): State<AppState>,
+    AxumPath(goal_id): AxumPath<String>,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<CollectionPage<ResourceDocument<PartialWorkArtifact>>>, CoordinationApiError> {
+    let root = state.tracker_root.read().await.clone();
+    let artifacts = partial_work_for_goal(&Tracker::new(root), &goal_id)
+        .map_err(|error| CoordinationApiError::internal(error.to_string()))?
+        .into_iter()
+        .map(|artifact| {
+            ResourceDocument::new(
+                "partial_work",
+                ResourceMetadata {
+                    id: artifact.id.clone(),
+                    resource_version: resource_version(&artifact),
+                    created_at: artifact.created_at,
+                    updated_at: artifact.updated_at,
+                },
+                artifact,
+            )
+        })
+        .collect::<Vec<_>>();
+    let (start, end, next) =
+        page_bounds(&artifacts, &query, |artifact| artifact.metadata.id.as_str())?;
+    Ok(Json(CollectionPage::new(
+        artifacts[start..end].to_vec(),
+        next,
+    )))
+}
+
+async fn get_coordination_goal_delivery(
+    State(state): State<AppState>,
+    AxumPath(goal_id): AxumPath<String>,
+) -> Result<Json<ResourceDocument<GoalDeliveryState>>, CoordinationApiError> {
+    let root = state.tracker_root.read().await.clone();
+    let delivery = read_goal_delivery_state(&Tracker::new(root), &goal_id)
+        .map_err(|error| CoordinationApiError::internal(error.to_string()))?
+        .ok_or_else(|| CoordinationApiError::not_found("goal delivery has not started"))?;
+    Ok(Json(ResourceDocument::new(
+        "goal_delivery",
+        ResourceMetadata {
+            id: goal_id,
+            resource_version: resource_version(&delivery),
+            created_at: delivery.updated_at,
+            updated_at: delivery.updated_at,
+        },
+        delivery,
+    )))
 }
 
 async fn list_coordination_packages(

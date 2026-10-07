@@ -219,6 +219,21 @@ type CoordinationPreflight = {
   evaluatedAt: string;
   checks: Array<{ kind: string; passed: boolean; summary: string; evidenceRefs: string[] }>;
 };
+type CoordinationGoalDelivery = {
+  goalId: string;
+  integrationBranch: string;
+  targetBranch: string;
+  remote: string;
+  mergePolicy: "manual";
+  status: "local" | "pushed" | "pull_request_open" | "needs_attention";
+  integrationWorktree: string;
+  headRevision: string;
+  pushedRevision?: string | null;
+  pullRequestNumber?: number | null;
+  pullRequestUrl?: string | null;
+  lastError?: string | null;
+  updatedAt: string;
+};
 type CoordinationEscalation = {
   kind: "hard_blocker" | "decision_point";
   severity: string;
@@ -269,6 +284,8 @@ type GoalActivityItem = {
 };
 type GoalWorkerCardData = {
   id: string;
+  createdAt?: string;
+  updatedAt?: string;
   state: string;
   claimId: string | null;
   claimLabel: string;
@@ -313,6 +330,7 @@ type GoalPoolSummary = {
   packages: Array<CoordinationResource<CoordinationPackage>>;
   contracts: Array<CoordinationResource<CoordinationContract>>;
   integrations: GoalIntegrationArtifactData[];
+  delivery: CoordinationResource<CoordinationGoalDelivery> | null;
   activity: GoalActivityItem[];
   escalations: GoalEscalationData[];
 };
@@ -455,6 +473,13 @@ type AppServerModelPage = { data: AppServerModel[]; nextCursor: string | null };
 type HistoryMessage = { id: string; role: "user" | "assistant"; text: string; status: string; images?: string[] };
 type HistoryTurn = { id: string; messages: HistoryMessage[]; working: HistoryMessage[] };
 type AgentMessagePhase = "commentary" | "final_answer";
+type WorkerCompletionResult = {
+  summary: string;
+  completedStepIds: string[];
+  validationCommands: string[];
+  evidenceRefs: string[];
+  knownRisks: string[];
+};
 
 const emptyUsage: Usage = {
   input_tokens: 0,
@@ -735,9 +760,10 @@ function workerStateTone(state: string): "healthy" | "attention" | "paused" | "i
 
 async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
   const goal = encodeURIComponent(goalId);
-  const [pool, healthSnapshot, readyWork, claims, packages, workerResources, artifacts, contracts, events, interventions, notifications, escalationResources] = await Promise.all([
+  const [pool, healthSnapshot, delivery, readyWork, claims, packages, workerResources, artifacts, contracts, events, interventions, notifications, escalationResources] = await Promise.all([
     optionalApi<CoordinationResource<CoordinationPool>>(`/coordination/v1/goals/${goal}/pool`),
     optionalApi<CoordinationResource<CoordinationGoalHealth>>(`/coordination/v1/goals/${goal}/health`),
+    optionalApi<CoordinationResource<CoordinationGoalDelivery>>(`/coordination/v1/goals/${goal}/delivery`),
     allCoordinationItems<CoordinationReadyScope>(`/coordination/v1/goals/${goal}/ready-work`),
     allCoordinationItems<CoordinationClaim>(`/coordination/v1/goals/${goal}/claims`),
     allCoordinationItems<CoordinationPackage>(`/coordination/v1/goals/${goal}/packages`),
@@ -822,10 +848,14 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
     })));
   const workers = workerResources.map((resource): GoalWorkerCardData => {
     const worker = resource.data;
+    const ownedClaims = claims
+      .filter((candidate) => candidate.data.owner === resource.metadata.id)
+      .sort((left, right) => right.metadata.updatedAt.localeCompare(left.metadata.updatedAt));
     const claim = (worker.activeClaims || [])
       .map((claimId) => claimById.get(claimId))
       .find((candidate) => candidate?.data.state === "active")
-      || claims.find((candidate) => candidate.data.owner === resource.metadata.id && candidate.data.state === "active")
+      || ownedClaims.find((candidate) => candidate.data.state === "active")
+      || ownedClaims[0]
       || null;
     const packageId = claim?.data.scope.kind === "work_package"
       ? claim.data.scope.work_package_id || null
@@ -849,8 +879,11 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
     const failureCode = terminalRun?.terminal_error?.code || null;
     const failureMessage = terminalRun?.terminal_error?.message || terminalRun?.error || null;
     const workspacePath = worker.workspace?.worktreePath || null;
+    const runtimeInterrupted = worker.state === "recovering" && !worker.currentRunId;
     return {
       id: resource.metadata.id,
+      createdAt: resource.metadata.createdAt,
+      updatedAt: resource.metadata.updatedAt,
       state: worker.state,
       claimId: claim?.metadata.id || null,
       claimLabel: packageRecord?.title || featureId || (claim ? "Claimed work" : "No active claim"),
@@ -859,7 +892,9 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
       threadId: worker.currentThreadId || latestTurn?.threadId || null,
       branch: worker.workspace?.branch || null,
       workspacePath,
-      activity: coordinationEventSummary(latestActivity),
+      activity: runtimeInterrupted
+        ? "Runtime interrupted; Golazo is preserving the workspace and reassigning this claim"
+        : coordinationEventSummary(latestActivity),
       activityAt: latestActivity?.occurredAt || null,
       validation,
       lastHeartbeatAt: worker.lastHeartbeatAt || claim?.data.heartbeatAt || null,
@@ -871,6 +906,7 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
   }).sort((left, right) => {
     const terminal = new Set(["completed", "failed", "cancelled"]);
     return Number(terminal.has(left.state)) - Number(terminal.has(right.state))
+      || (right.updatedAt || "").localeCompare(left.updatedAt || "")
       || left.id.localeCompare(right.id);
   });
   const activityTone = (state: string, severity = ""): GoalActivityItem["tone"] => {
@@ -1026,6 +1062,7 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
       packages,
       contracts,
       integrations,
+      delivery,
       activity,
       escalations,
     };
@@ -1077,6 +1114,7 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
     packages,
     contracts,
     integrations,
+    delivery,
     activity,
     escalations,
   };
@@ -1093,6 +1131,191 @@ function normalizeLLMConfig(config: LLMConfig): LLMConfig {
 
 const number = (value = 0) => new Intl.NumberFormat().format(value);
 const time = (value: string) => new Date(value).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
+function parseWorkerStructuredUpdate(text: string): WorkerCompletionResult | null {
+  const trimmed = text.trim();
+  let candidate = trimmed;
+  if (trimmed.startsWith("```")) {
+    candidate = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  } else if (!trimmed.startsWith("{")) {
+    return null;
+  }
+  try {
+    const value = JSON.parse(candidate) as Partial<WorkerCompletionResult>;
+    const stringList = (item: unknown): item is string[] => Array.isArray(item) && item.every((entry) => typeof entry === "string");
+    if (typeof value.summary !== "string" || !value.summary.trim()
+      || !stringList(value.completedStepIds)
+      || !stringList(value.validationCommands)
+      || !stringList(value.evidenceRefs)
+      || !stringList(value.knownRisks)) return null;
+    return {
+      summary: value.summary.trim(),
+      completedStepIds: value.completedStepIds,
+      validationCommands: value.validationCommands,
+      evidenceRefs: value.evidenceRefs,
+      knownRisks: value.knownRisks,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseWorkerCompletionResult(text: string): WorkerCompletionResult | null {
+  const result = parseWorkerStructuredUpdate(text);
+  return result && result.completedStepIds.length > 0 ? result : null;
+}
+
+function readableIdentifier(value: string): string {
+  const words = value.replace(/[_-]+/g, " ").trim();
+  return words ? words[0].toUpperCase() + words.slice(1) : value;
+}
+
+function validationCommandLabel(command: string, index: number): string {
+  const normalized = command.toLowerCase();
+  if (normalized.includes("dotnet test") || normalized.includes("vitest") || normalized.includes("npm test") || normalized.includes("pnpm test")) return "Test suite";
+  if (normalized.includes("dotnet build") || normalized.includes("vite build") || normalized.includes("cargo build")) return "Build";
+  if (normalized.includes("typecheck") || normalized.includes("tsc ")) return "Type check";
+  if (normalized.includes("git diff --check")) return "Repository diff check";
+  if (normalized.includes("cargo fmt") || normalized.includes("prettier") || normalized.includes("eslint")) return "Formatting and lint";
+  return `Validation ${index + 1}`;
+}
+
+function workerRiskLabel(risk: string): string {
+  const normalized = risk.toLowerCase();
+  if (normalized.includes("vstest") || normalized.includes("test suite") || normalized.includes("tests did not") || normalized.includes("test execution")) return "Tests not run";
+  if (normalized.includes("pnpm") || normalized.includes("dependency cache") || normalized.includes("package manager")) return "Tooling fallback";
+  if (normalized.includes("sandbox") || normalized.includes("permission")) return "Sandbox limitation";
+  return "Known limitation";
+}
+
+function sameThreadTurns(current: AppServerThread | null, next: AppServerThread): boolean {
+  return Boolean(current && current.id === next.id && JSON.stringify(current.turns) === JSON.stringify(next.turns));
+}
+
+function preservedChatScrollTop(scrollTop: number, scrollHeight: number, clientHeight: number): number {
+  return Math.min(scrollTop, Math.max(0, scrollHeight - clientHeight));
+}
+
+function unreadResponseDelta(previousCount: number, nextCount: number): number {
+  return Math.max(0, nextCount - previousCount);
+}
+
+function ScrollToLatestButton({ unreadCount, onClick }: { unreadCount: number; onClick: () => void }) {
+  const unreadLabel = unreadCount > 0
+    ? `${unreadCount} new ${unreadCount === 1 ? "response" : "responses"}`
+    : null;
+  return (
+    <button
+      type="button"
+      className="scroll-to-bottom"
+      onClick={onClick}
+      aria-label={unreadLabel ? `Scroll to latest message, ${unreadLabel}` : "Scroll to latest message"}
+      title={unreadLabel || "Scroll to latest message"}
+    >
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 8 5 5 5-5" /></svg>
+      {unreadCount > 0 && <span className="scroll-to-bottom-badge" aria-hidden="true">{unreadCount > 99 ? "99+" : unreadCount}</span>}
+    </button>
+  );
+}
+
+function WorkerCompletionCard({ result, raw }: { result: WorkerCompletionResult; raw: string }) {
+  return (
+    <div className="worker-completion-card">
+      <header>
+        <span className="worker-completion-icon" aria-hidden="true">✓</span>
+        <div><small>Worker completed</small><strong>{result.summary}</strong></div>
+      </header>
+      <section>
+        <h3>Completed work</h3>
+        <ul className="worker-completion-steps">
+          {result.completedStepIds.map((step) => <li key={step}><i aria-hidden="true">✓</i><span>{readableIdentifier(step)}<code>{step}</code></span></li>)}
+        </ul>
+      </section>
+      {result.knownRisks.length > 0 && (
+        <section className="worker-completion-risks">
+          <div><h3>Verification gaps</h3><small>The implementation completed, but these checks need follow-up before merge.</small></div>
+          {result.knownRisks.map((risk) => <p key={risk}><i aria-hidden="true">!</i><span><strong>{workerRiskLabel(risk)}</strong>{risk}</span></p>)}
+        </section>
+      )}
+      <div className="worker-completion-supporting">
+        {result.validationCommands.length > 0 && (
+          <details>
+            <summary><span>Validation</span><em>{result.validationCommands.length}</em></summary>
+            <ul>{result.validationCommands.map((command, index) => <li key={`${command}-${index}`}><strong>{validationCommandLabel(command, index)}</strong><code>{command}</code></li>)}</ul>
+          </details>
+        )}
+        {result.evidenceRefs.length > 0 && (
+          <details>
+            <summary><span>Evidence</span><em>{result.evidenceRefs.length}</em></summary>
+            <ul>{result.evidenceRefs.map((evidence, index) => <li key={`${evidence}-${index}`}><code>{evidence}</code></li>)}</ul>
+          </details>
+        )}
+        <details>
+          <summary><span>Raw structured result</span><em>JSON</em></summary>
+          <pre>{JSON.stringify(JSON.parse(raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")), null, 2)}</pre>
+        </details>
+      </div>
+    </div>
+  );
+}
+
+function WorkerProgressCard({ result, raw }: { result: WorkerCompletionResult; raw: string }) {
+  return (
+    <div className="worker-completion-card worker-progress-card">
+      <header>
+        <span className="worker-progress-icon" aria-hidden="true"><i /></span>
+        <div><small>Worker progress</small><strong>{result.summary}</strong></div>
+      </header>
+      {result.completedStepIds.length > 0 && (
+        <section>
+          <h3>Reported completed work</h3>
+          <ul className="worker-completion-steps">
+            {result.completedStepIds.map((step) => <li key={step}><i aria-hidden="true">✓</i><span>{readableIdentifier(step)}<code>{step}</code></span></li>)}
+          </ul>
+        </section>
+      )}
+      {result.knownRisks.length > 0 && (
+        <section className="worker-completion-risks">
+          <div><h3>Current risks</h3><small>These items may need follow-up before the worker can finish.</small></div>
+          {result.knownRisks.map((risk) => <p key={risk}><i aria-hidden="true">!</i><span><strong>{workerRiskLabel(risk)}</strong>{risk}</span></p>)}
+        </section>
+      )}
+      <div className="worker-completion-supporting">
+        {result.validationCommands.length > 0 && (
+          <details>
+            <summary><span>Planned validation</span><em>{result.validationCommands.length}</em></summary>
+            <ul>{result.validationCommands.map((command, index) => <li key={`${command}-${index}`}><strong>{validationCommandLabel(command, index)}</strong><code>{command}</code></li>)}</ul>
+          </details>
+        )}
+        {result.evidenceRefs.length > 0 && (
+          <details>
+            <summary><span>Evidence so far</span><em>{result.evidenceRefs.length}</em></summary>
+            <ul>{result.evidenceRefs.map((evidence, index) => <li key={`${evidence}-${index}`}><code>{evidence}</code></li>)}</ul>
+          </details>
+        )}
+        <details>
+          <summary><span>Raw structured update</span><em>JSON</em></summary>
+          <pre>{JSON.stringify(JSON.parse(raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")), null, 2)}</pre>
+        </details>
+      </div>
+    </div>
+  );
+}
+
+function WorkingUpdateContent({ text }: { text: string }) {
+  const result = parseWorkerStructuredUpdate(text);
+  if (result) return <WorkerProgressCard result={result} raw={text} />;
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{") && /"(?:completedStepIds|evidenceRefs|knownRisks|summary|validationCommands)"/.test(trimmed)) {
+    return <p className="structured-update-pending"><i className="spinner" />Receiving structured worker update…</p>;
+  }
+  return <p>{text}</p>;
+}
+
+function AssistantMessageContent({ text }: { text: string }) {
+  const result = parseWorkerCompletionResult(text);
+  return result ? <WorkerCompletionCard result={result} raw={text} /> : <>{text}</>;
+}
 
 function historyTurns(thread: AppServerThread | null): HistoryTurn[] {
   if (!thread) return [];
@@ -1420,7 +1643,7 @@ function GoalPoolControls({
   const [desiredConcurrency, setDesiredConcurrency] = useState(2);
   const [readyUnitId, setReadyUnitId] = useState("");
   const [assignmentWorkerId, setAssignmentWorkerId] = useState("");
-  const [baseRevision, setBaseRevision] = useState("workspace-current");
+  const [baseRevision, setBaseRevision] = useState("goal-current");
   const [claimId, setClaimId] = useState("");
   const [replacementWorkerId, setReplacementWorkerId] = useState("");
   const [claimReason, setClaimReason] = useState("");
@@ -1496,7 +1719,7 @@ function GoalPoolControls({
       Object.assign(command, workerPermissionPolicies(permissionMode));
       command.resourcePolicy = defaultWorkerResourcePolicy();
     }
-    if (["configure", "start", "resume", "reconcile"].includes(action)) command.baseRevision = baseRevision.trim() || "workspace-current";
+    if (["configure", "start", "resume", "reconcile"].includes(action)) command.baseRevision = baseRevision.trim() || "goal-current";
     const label = action === "reconcile" ? "Fill ready work" : humanizeCoordinationState(action);
     void perform(label, () => coordinationCommand(
       `/coordination/v1/goals/${encodeURIComponent(goalId)}/pool/commands`,
@@ -1516,7 +1739,7 @@ function GoalPoolControls({
       {
         workerId: assignmentWorkerId,
         requestedScope: unit.data,
-        baseRevision: baseRevision.trim() || "workspace-current",
+        baseRevision: baseRevision.trim() || "goal-current",
       },
     ));
   };
@@ -1531,7 +1754,7 @@ function GoalPoolControls({
         action: "reassign",
         replacementWorkerId,
         expectedGeneration: selectedClaim.data.leaseGeneration,
-        baseRevision: selectedClaim.data.baseRevision || baseRevision.trim() || "workspace-current",
+        baseRevision: selectedClaim.data.baseRevision || baseRevision.trim() || "goal-current",
         reason: claimReason.trim(),
         decidedBy: actor,
       },
@@ -1610,7 +1833,7 @@ function GoalPoolControls({
         </p>
         <div className="capacity-control">
           <label>Desired workers<input type="number" min="1" max="4" value={desiredConcurrency} onChange={(event) => setDesiredConcurrency(Math.max(1, Math.min(4, Number(event.target.value) || 1)))} /></label>
-          <label>Base revision<input value={baseRevision} onChange={(event) => setBaseRevision(event.target.value)} maxLength={500} /></label>
+          <label>Goal base revision<input value={baseRevision} onChange={(event) => setBaseRevision(event.target.value)} maxLength={500} /></label>
           <button type="button" onClick={() => poolCommand("configure")} disabled={Boolean(pending)}>Configure</button>
         </div>
         <div className="control-actions" role="group" aria-label="Worker pool lifecycle">
@@ -1659,6 +1882,131 @@ function GoalPoolControls({
       </details>
 
       {(notice || error) && <p className={`control-feedback ${error ? "error" : "success"}`} role={error ? "alert" : "status"}>{error || notice}</p>}
+    </section>
+  );
+}
+
+const terminalWorkerStates = new Set(["completed", "failed", "cancelled"]);
+const engagedWorkerStates = new Set(["starting", "active", "waiting", "paused", "blocked", "recovering"]);
+
+function dockWorkers(summary: GoalPoolSummary): GoalWorkerCardData[] {
+  const limit = Math.max(1, summary.desiredConcurrency, summary.activeWorkers);
+  const workers = [...summary.workers].sort((left, right) => {
+    const leftEngaged = engagedWorkerStates.has(left.state);
+    const rightEngaged = engagedWorkerStates.has(right.state);
+    return Number(rightEngaged) - Number(leftEngaged)
+      || (right.updatedAt || right.activityAt || "").localeCompare(left.updatedAt || left.activityAt || "")
+      || left.id.localeCompare(right.id);
+  });
+  const engaged = workers.filter((worker) => engagedWorkerStates.has(worker.state));
+  const recentTerminal = workers.filter((worker) => terminalWorkerStates.has(worker.state));
+  if (!engaged.length) return recentTerminal.slice(0, limit);
+  return [...engaged, ...recentTerminal.slice(0, Math.max(0, limit - engaged.length))];
+}
+
+function workerDockStatus(workers: GoalWorkerCardData[]): string {
+  const working = workers.filter((worker) => ["starting", "active", "waiting"].includes(worker.state)).length;
+  const completed = workers.filter((worker) => worker.state === "completed").length;
+  const attention = workers.filter((worker) => ["blocked", "failed", "recovering"].includes(worker.state)).length;
+  const parts = [working ? `${working} working` : "", completed ? `${completed} complete` : "", attention ? `${attention} need attention` : ""].filter(Boolean);
+  if (!attention && parts.length) parts.push("no action needed");
+  return parts.join(" · ") || "Workers are preparing";
+}
+
+function GoalWorkerDock({
+  summary,
+  loading,
+  error,
+  onOpenThread,
+}: {
+  summary: GoalPoolSummary | null;
+  loading: boolean;
+  error: string | null;
+  onOpenThread?: (threadId: string) => void;
+}) {
+  const workers = useMemo(() => summary ? dockWorkers(summary) : [], [summary]);
+  const priority = Boolean(summary && (summary.mode === "running" || summary.activeWorkers > 0 || summary.runningIntegrations > 0));
+  const firstWorkerId = workers[0]?.id || null;
+  const workerKey = workers.map((worker) => worker.id).join(":");
+  const [expandedWorkerIds, setExpandedWorkerIds] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!priority || !firstWorkerId) {
+      setExpandedWorkerIds([]);
+      return;
+    }
+    setExpandedWorkerIds((current) => current.some((id) => workers.some((worker) => worker.id === id)) ? current : [firstWorkerId]);
+  }, [firstWorkerId, priority, workerKey]);
+
+  if (!summary || (!workers.length && !priority)) return null;
+
+  const completed = workers.filter((worker) => worker.state === "completed").length;
+  const failed = workers.filter((worker) => ["failed", "blocked", "recovering"].includes(worker.state)).length;
+  const working = workers.filter((worker) => ["starting", "active", "waiting"].includes(worker.state)).length;
+  const recovering = workers.filter((worker) => worker.state === "recovering").length;
+  const recoveryOnly = recovering > 0 && working === 0;
+  const idleSummary = [completed ? `${completed} completed` : "", failed ? `${failed} need attention` : ""].filter(Boolean).join(" · ") || `${workers.length} workers`;
+  const latestUpdate = workers.map((worker) => worker.updatedAt || worker.activityAt).filter((value): value is string => Boolean(value)).sort().at(-1) || summary.refreshedAt;
+
+  const workerRows = (
+    <div className="worker-dock-list">
+      {workers.map((worker) => {
+        const expanded = expandedWorkerIds.includes(worker.id);
+        const tone = workerStateTone(worker.state);
+        return (
+          <details
+            className="worker-dock-row"
+            open={expanded}
+            onToggle={(event) => {
+              const open = event.currentTarget.open;
+              setExpandedWorkerIds((current) => open
+                ? current.includes(worker.id) ? current : [...current, worker.id]
+                : current.filter((id) => id !== worker.id));
+            }}
+            key={worker.id}
+          >
+            <summary>
+              <span className={`worker-state ${tone}`} aria-hidden="true" />
+              <span className="worker-dock-identity"><strong>{worker.claimLabel}</strong><small>Worker {compactIdentifier(worker.id)}</small></span>
+              <span className="worker-dock-activity">{worker.activity}</span>
+              <span className="worker-dock-state">{humanizeCoordinationState(worker.state)}</span>
+              <i className="worker-card-chevron" aria-hidden="true" />
+            </summary>
+            <div className="worker-dock-details">
+              <dl>
+                <div><dt>State</dt><dd>{humanizeCoordinationState(worker.state)}</dd></div>
+                <div><dt>Validation</dt><dd>{worker.validation === "unknown" ? "Not reported" : humanizeCoordinationState(worker.validation)}</dd></div>
+                <div><dt>{worker.state === "recovering" ? "Last run" : "Run"}</dt><dd title={worker.runId || undefined}>{compactIdentifier(worker.runId)}</dd></div>
+                <div><dt>Thread</dt><dd title={worker.threadId || undefined}>{compactIdentifier(worker.threadId)}</dd></div>
+                <div><dt>Workspace</dt><dd title={worker.workspacePath || undefined}>{workspaceName(worker.workspacePath)}</dd></div>
+                <div><dt>Branch</dt><dd title={worker.branch || undefined}>{worker.branch || "Not reported"}</dd></div>
+              </dl>
+              <div className="worker-dock-latest"><span>Latest activity</span><time title={worker.activityAt || undefined}>{relativeTimestamp(worker.activityAt)}</time><p>{worker.activity}</p></div>
+              {worker.failureMessage && <div className="worker-dock-failure" role="alert"><strong>{worker.failureCode ? humanizeErrorCode(worker.failureCode) : "Worker run failed"}</strong><p>{worker.failureMessage}</p>{worker.recoveryGuidance && <small>{worker.recoveryGuidance}</small>}</div>}
+              {worker.threadId && onOpenThread && <button type="button" className="worker-dock-thread" onClick={() => onOpenThread(worker.threadId!)}>Open worker thread</button>}
+            </div>
+          </details>
+        );
+      })}
+      {!workers.length && <div className="worker-dock-empty">Workers are starting. Detailed status will appear when the first claim is bound.</div>}
+    </div>
+  );
+
+  if (!priority) {
+    return (
+      <details className="worker-pool-dock idle" aria-label="Last worker pool activity">
+        <summary><span className="worker-dock-idle-dot" aria-hidden="true" /><span><strong>Last worker run</strong><small>{idleSummary} · updated {relativeTimestamp(latestUpdate)}</small></span><em>View details</em><i className="worker-card-chevron" aria-hidden="true" /></summary>
+        {workerRows}
+      </details>
+    );
+  }
+
+  return (
+    <section className={`worker-pool-dock priority${recoveryOnly ? " recovery" : ""}`} aria-label={recoveryOnly ? "Worker recovery required" : "Live worker pool"} aria-busy={loading}>
+      <header><span className="worker-dock-live-dot" aria-hidden="true" /><span><strong>{recoveryOnly ? "Worker recovery required" : "Live worker pool"}</strong><small>{workerDockStatus(workers)}</small></span><em>{error ? "Updates interrupted" : `Updated ${relativeTimestamp(summary.refreshedAt)}`}</em></header>
+      {recoveryOnly && <p className="worker-dock-recovery" role="status">No worker process is currently running. Golazo is preserving any partial work and assigning replacement workers.</p>}
+      {error && <p className="worker-dock-stale" role="alert">Showing the last successful worker snapshot while Golazo reconnects.</p>}
+      {workerRows}
     </section>
   );
 }
@@ -1943,10 +2291,12 @@ function GoalClaimPackageDetails({
 function GoalIntegrationView({
   goalId,
   integrations,
+  delivery,
   loading,
 }: {
   goalId: string;
   integrations: GoalIntegrationArtifactData[];
+  delivery: CoordinationResource<CoordinationGoalDelivery> | null;
   loading: boolean;
 }) {
   const [preflights, setPreflights] = useState<Record<string, CoordinationResource<CoordinationPreflight>>>({});
@@ -1982,6 +2332,22 @@ function GoalIntegrationView({
         <h2 id="integration-view-heading">Integration</h2>
         <span>{integrations.length}</span>
       </div>
+      {delivery && (
+        <article className={`goal-delivery-card ${delivery.data.status}`}>
+          <div>
+            <span>Goal delivery</span>
+            <strong>{delivery.data.integrationBranch}</strong>
+            <small>Targets {delivery.data.targetBranch} · {humanizeCoordinationState(delivery.data.mergePolicy)} merge</small>
+          </div>
+          <div>
+            <em>{humanizeCoordinationState(delivery.data.status)}</em>
+            {delivery.data.pullRequestUrl
+              ? <a href={delivery.data.pullRequestUrl} target="_blank" rel="noreferrer">PR #{delivery.data.pullRequestNumber || ""}</a>
+              : <small>{delivery.data.status === "local" ? "Not pushed yet" : "Pull request pending"}</small>}
+          </div>
+          {delivery.data.lastError && <p role="alert">{delivery.data.lastError}</p>}
+        </article>
+      )}
       {error && <p className="control-feedback error" role="alert">{error}</p>}
       {integrations.length ? (
         <div className="integration-list">
@@ -2626,14 +2992,17 @@ export default function App() {
   const [conversationSyncedAt, setConversationSyncedAt] = useState<number | null>(null);
   const [toast, setToast] = useState("");
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [unreadResponseCount, setUnreadResponseCount] = useState(0);
   const promptRef = useRef<HTMLTextAreaElement | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const settingsRef = useRef<HTMLDivElement | null>(null);
   const permissionsRef = useRef<HTMLDivElement | null>(null);
   const profileRef = useRef<HTMLDivElement | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
-  const pendingInitialScroll = useRef<string | null>(null);
-  const messagesAtBottom = useRef(true);
+  const messageScrollTop = useRef(0);
+  const scrollThreadId = useRef<string | null>(null);
+  const initializedHistoryThreadId = useRef<string | null>(null);
+  const lastResponseCount = useRef(0);
   const lastEventSequence = useRef(0);
   const liveMessagePhases = useRef(new Map<string, AgentMessagePhase>());
 
@@ -2766,7 +3135,7 @@ export default function App() {
       }
       void refreshAppServer();
       if (threadId && event.params.threadId === threadId) {
-        void api<AppServerThread>(`/app-server/threads/${encodeURIComponent(threadId)}`).then(setAppHistory);
+        void api<AppServerThread>(`/app-server/threads/${encodeURIComponent(threadId)}`).then(setAppHistory).catch(() => undefined);
       }
       if (event.method === "turn/completed") {
         setLiveAssistant(""); setLiveWorking(""); liveMessagePhases.current.clear(); void refresh();
@@ -2889,6 +3258,10 @@ export default function App() {
   const displayedPermission = permissionOptions.find((option) => option.value === activePermissionMode) || selectedPermission;
   const busy = modeSwitching || Boolean(activeRun);
   const restoredTurns = useMemo(() => restoreLocalUserPrompts(historyTurns(appHistory), chatRuns), [appHistory, chatRuns]);
+  const responseCount = useMemo(() => restoredTurns.length
+    ? restoredTurns.reduce((total, turn) => total + turn.messages.filter((message) => message.role === "assistant").length, 0)
+    : chatRuns.filter((run) => run.status === "completed" || run.status === "failed").length,
+  [chatRuns, restoredTurns]);
   const codexLimitSnapshot = useMemo(() => {
     if (!codexRateLimits) return null;
     const buckets = Object.values(codexRateLimits.rateLimitsByLimitId || {});
@@ -2904,24 +3277,23 @@ export default function App() {
   const updateMessageScrollState = useCallback(() => {
     const messages = messagesRef.current;
     if (!messages) return;
+    messageScrollTop.current = messages.scrollTop;
     const distanceFromBottom = messages.scrollHeight - messages.clientHeight - messages.scrollTop;
     const atBottom = distanceFromBottom <= 48;
-    messagesAtBottom.current = atBottom;
+    if (atBottom) setUnreadResponseCount(0);
     setShowScrollToBottom(!atBottom && messages.scrollHeight > messages.clientHeight);
   }, []);
 
   const scrollToLatestMessage = useCallback((behavior: ScrollBehavior = "smooth") => {
     const messages = messagesRef.current;
     if (!messages) return;
-    messagesAtBottom.current = true;
+    messageScrollTop.current = messages.scrollHeight;
+    setUnreadResponseCount(0);
     setShowScrollToBottom(false);
     messages.scrollTo({ top: messages.scrollHeight, behavior });
   }, []);
 
   useEffect(() => {
-    pendingInitialScroll.current = threadId;
-    messagesAtBottom.current = true;
-    setShowScrollToBottom(false);
     if (!threadId) {
       setAppHistory(null);
       return;
@@ -2930,29 +3302,46 @@ export default function App() {
     let cancelled = false;
     setAppHistory((current) => current?.id === threadId ? current : null);
     const loadHistory = () => api<AppServerThread>(`/app-server/threads/${encodeURIComponent(threadId)}`)
-      .then((history) => { if (!cancelled) setAppHistory(history); })
-      .catch(() => {
+      .then((history) => {
         if (cancelled) return;
-        setAppHistory(null);
-        pendingInitialScroll.current = null;
-        window.requestAnimationFrame(() => scrollToLatestMessage("auto"));
-      });
+        setAppHistory((current) => sameThreadTurns(current, history) ? current : history);
+      })
+      .catch(() => undefined);
     void loadHistory();
-    const timer = window.setInterval(() => void loadHistory(), 5000);
+    const timer = window.setInterval(() => void loadHistory(), 30000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, [scrollToLatestMessage, threadId]);
+  }, [threadId]);
 
   useLayoutEffect(() => {
-    if (!threadId || appHistory?.id !== threadId || pendingInitialScroll.current !== threadId) return;
-    scrollToLatestMessage("auto");
-    pendingInitialScroll.current = null;
-  }, [appHistory, restoredTurns, scrollToLatestMessage, threadId]);
+    const messages = messagesRef.current;
+    if (!messages) return;
 
-  useLayoutEffect(() => {
-    if (pendingInitialScroll.current) return;
-    if (messagesAtBottom.current) scrollToLatestMessage("auto");
-    else updateMessageScrollState();
-  }, [approvals.length, chatRuns, liveAssistant, liveWorking, restoredTurns, scrollToLatestMessage, updateMessageScrollState]);
+    const switchedThreads = scrollThreadId.current !== threadId;
+    if (switchedThreads) {
+      scrollThreadId.current = threadId;
+      initializedHistoryThreadId.current = null;
+      lastResponseCount.current = responseCount;
+      messageScrollTop.current = 0;
+      messages.scrollTop = 0;
+      setUnreadResponseCount(0);
+    } else {
+      messages.scrollTop = preservedChatScrollTop(messageScrollTop.current, messages.scrollHeight, messages.clientHeight);
+    }
+
+    const initialHistoryArrived = Boolean(threadId)
+      && appHistory?.id === threadId
+      && initializedHistoryThreadId.current !== threadId;
+    if (initialHistoryArrived) {
+      initializedHistoryThreadId.current = threadId;
+      lastResponseCount.current = responseCount;
+    } else if (initializedHistoryThreadId.current === threadId) {
+      const addedResponses = unreadResponseDelta(lastResponseCount.current, responseCount);
+      lastResponseCount.current = responseCount;
+      if (addedResponses > 0) setUnreadResponseCount((current) => current + addedResponses);
+    }
+
+    updateMessageScrollState();
+  }, [appHistory?.id, approvals.length, chatRuns, liveAssistant, liveWorking, responseCount, restoredTurns, threadId, updateMessageScrollState]);
 
   async function send(event: FormEvent) {
     event.preventDefault();
@@ -3429,14 +3818,14 @@ export default function App() {
                       <details className="working-updates">
                         <summary><span>Working updates</span><em>{turn.working.length}</em></summary>
                         <div className="working-update-list">
-                          {turn.working.map((message) => <p key={message.id}>{message.text}</p>)}
+                          {turn.working.map((message) => <WorkingUpdateContent key={message.id} text={message.text} />)}
                         </div>
                       </details>
                     )}
                     {turn.messages.filter((message) => message.role === "assistant").map((message) => (
                       <article className="message assistant" key={message.id}>
                         <div className="message-meta"><span className="avatar">C</span><span>Codex · {message.status}</span></div>
-                        <div className="bubble">{message.text}</div>
+                        <div className={`bubble ${parseWorkerCompletionResult(message.text) ? "structured-result-bubble" : ""}`}><AssistantMessageContent text={message.text} /></div>
                       </article>
                     ))}
                   </div>
@@ -3446,7 +3835,7 @@ export default function App() {
                     <article className="message assistant"><div className="message-meta"><span className="avatar">C</span><span>Codex · {run.status}</span></div>
                       {run.status === "queued" || run.status === "running" ? <div className="bubble"><span className="running-line"><i className="spinner" />Codex is working · {run.events.length} events</span></div>
                         : run.status === "failed" ? <div className="bubble error-bubble">{run.error || "The run failed."}</div>
-                          : <><div className="bubble">{run.final_message || "Completed without a final message."}</div><div className="usage-chip"><b>{number(run.usage.total_tokens)} tokens</b><span>{number(run.usage.input_tokens)} in</span><span>{number(run.usage.output_tokens)} out</span><span>{number(run.usage.cached_input_tokens)} cached</span><span>{number(run.usage.reasoning_output_tokens)} reasoning</span></div></>}
+                          : <><div className={`bubble ${parseWorkerCompletionResult(run.final_message || "") ? "structured-result-bubble" : ""}`}><AssistantMessageContent text={run.final_message || "Completed without a final message."} /></div><div className="usage-chip"><b>{number(run.usage.total_tokens)} tokens</b><span>{number(run.usage.input_tokens)} in</span><span>{number(run.usage.output_tokens)} out</span><span>{number(run.usage.cached_input_tokens)} cached</span><span>{number(run.usage.reasoning_output_tokens)} reasoning</span></div></>}
                     </article>
                   </div>
                 )) : <div className="empty-chat"><div className="empty-orbit"><span>✦</span></div><h2>From intent to implementation.</h2><p>Shape the goal with Codex, review the plan, and build it one deliberate slice at a time.</p></div>}
@@ -3456,15 +3845,19 @@ export default function App() {
                     <div><button onClick={() => void decideApproval(approval.id, "decline")}>Deny</button><button onClick={() => void decideApproval(approval.id, "accept")}>Allow</button><button onClick={() => void decideApproval(approval.id, "acceptForSession")}>Always allow</button></div>
                   </section>
                 ))}
-                {liveWorking && <details className="working-updates live-working"><summary><span>Working updates</span><em>Live</em></summary><div className="working-update-list"><p>{liveWorking}</p></div></details>}
+                {liveWorking && <details className="working-updates live-working"><summary><span>Working updates</span><em>Live</em></summary><div className="working-update-list"><WorkingUpdateContent text={liveWorking} /></div></details>}
                 {liveAssistant && <article className="message assistant live-message"><div className="message-meta"><span className="avatar">C</span><span>Codex · streaming</span></div><div className="bubble">{liveAssistant}<i className="stream-caret" /></div></article>}
               </div>
               {showScrollToBottom && (
-                <button type="button" className="scroll-to-bottom" onClick={() => scrollToLatestMessage()} aria-label="Scroll to latest message" title="Scroll to latest message">
-                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 8 5 5 5-5" /></svg>
-                </button>
+                <ScrollToLatestButton unreadCount={unreadResponseCount} onClick={() => scrollToLatestMessage()} />
               )}
               </div>
+              <GoalWorkerDock
+                summary={goalPoolSummary}
+                loading={goalPoolLoading}
+                error={goalPoolError}
+                onOpenThread={(workerThreadId) => void selectThread(workerThreadId)}
+              />
               <form className="composer" onSubmit={send}>
                 {(pendingImages.length > 0 || pendingFiles.length > 0) && <div className="attachment-tray" aria-label="Attachments">{pendingImages.map((image) => <figure key={image.id}><img src={image.preview} alt={image.name} /><button type="button" onClick={() => setPendingImages((current) => current.filter((item) => item.id !== image.id))} aria-label={`Remove ${image.name}`} title={`Remove ${image.name}`}>×</button><figcaption>{image.name}</figcaption></figure>)}{pendingFiles.map((file) => <figure className="attachment-file" key={file.id}><div aria-hidden="true">▤<small>{file.name.split(".").pop()?.slice(0, 5) || "FILE"}</small></div><button type="button" onClick={() => setPendingFiles((current) => current.filter((item) => item.id !== file.id))} aria-label={`Remove ${file.name}`} title={`Remove ${file.name}`}>×</button><figcaption>{file.name}</figcaption></figure>)}</div>}
                 <textarea ref={promptRef} rows={1} value={prompt} onChange={(event) => setPrompt(event.target.value)} onPaste={(event) => void pasteImages(event)} placeholder={modeSwitching ? "Preparing the selected mode…" : selectedGoal ? (workMode === "spec" ? "Continue evolving the implementation document…" : "Ask Codex to implement one coherent tracker slice…") : "Create or select a goal first…"} aria-label={workMode === "spec" ? "Spec mode prompt" : "Build mode prompt"} disabled={modeSwitching} required={!pendingImages.length && !pendingFiles.length} />
@@ -3604,7 +3997,7 @@ export default function App() {
                   <GoalPoolControls goalId={selectedGoal} summary={goalPoolSummary} loading={goalPoolLoading} actor={profileIdentity} permissionMode={permissionMode} onChanged={() => setGoalPoolRefresh((value) => value + 1)} />
                   <GoalWorkers workers={goalPoolSummary?.workers || []} loading={goalPoolLoading} error={goalPoolError} />
                   <GoalClaimPackageDetails goal={goal} summary={goalPoolSummary} loading={goalPoolLoading} />
-                  <GoalIntegrationView goalId={selectedGoal} integrations={goalPoolSummary?.integrations || []} loading={goalPoolLoading} />
+                  <GoalIntegrationView goalId={selectedGoal} integrations={goalPoolSummary?.integrations || []} delivery={goalPoolSummary?.delivery || null} loading={goalPoolLoading} />
                   <GoalEscalationInbox escalations={goalPoolSummary?.escalations || []} loading={goalPoolLoading} />
                   <GoalActivityTimeline activity={goalPoolSummary?.activity || []} loading={goalPoolLoading} />
                 </AutonomousExecutionDisclosure>
@@ -3631,6 +4024,7 @@ export default function App() {
 }
 
 export {
+  AssistantMessageContent,
   AutonomousExecutionDisclosure,
   GoalActivityTimeline,
   GoalClaimPackageDetails,
@@ -3638,7 +4032,15 @@ export {
   GoalIntegrationView,
   GoalPoolControls,
   GoalPoolSummaryCard,
+  GoalWorkerDock,
   GoalWorkers,
   loadGoalPoolSummary,
+  parseWorkerCompletionResult,
+  parseWorkerStructuredUpdate,
+  preservedChatScrollTop,
+  ScrollToLatestButton,
+  sameThreadTurns,
+  unreadResponseDelta,
+  WorkingUpdateContent,
 };
 export type { GoalPoolSummary, GoalIntegrationArtifactData, GoalEscalationData, GoalWorkerCardData, Goal };

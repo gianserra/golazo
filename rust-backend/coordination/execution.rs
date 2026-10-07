@@ -1,6 +1,8 @@
 use super::claims::{CancelEvidence, ClaimPolicy, ClaimService};
+use super::delivery::{GoalDeliveryStatus, integrate_and_publish};
 use super::domain::{
-    Claim, ClaimId, ClaimScope, ClaimState, IntegrationValidationEvidence, ValidationGateKind,
+    Claim, ClaimId, ClaimScope, ClaimState, CoordinationActor, CoordinationEvent,
+    CoordinationEventKind, EventSeverity, IntegrationValidationEvidence, ValidationGateKind,
     WorkerId,
 };
 use super::integration::{
@@ -10,8 +12,11 @@ use super::integration::{
 };
 use super::pool::{WorkerFailureKind, WorkerPoolPolicy, WorkerPoolService};
 use super::protocol::{WorkerContextAssembler, WorkerContextLimits};
+use super::recovery_artifacts::{
+    mark_recovered, preserve_failed_work, preserved_work_for_scope, validate_recovery_candidate,
+};
 use super::store::{
-    ClaimRepository, IntegrationArtifactRepository, SqliteCoordinationStore,
+    ClaimRepository, EventRepository, IntegrationArtifactRepository, SqliteCoordinationStore,
     ValidationReportRepository, WorkerRepository,
 };
 use super::workspace::WorktreeManager;
@@ -101,6 +106,49 @@ pub fn recover_unstarted_claims(
         let never_dispatched = worker.workspace.is_none()
             && worker.current_run_id.is_none()
             && worker.turn_history.is_empty();
+        let interrupted_runtime = worker.state == super::domain::WorkerState::Recovering
+            && worker.current_run_id.is_none();
+        if interrupted_runtime {
+            let run_id = worker.turn_history.last().map(|turn| turn.run_id.as_str());
+            if let Some(workspace) = worker.workspace.as_ref() {
+                let manager =
+                    WorktreeManager::open(Path::new(&workspace.canonical_repository_path))
+                        .map_err(|error| error.to_string())?;
+                preserve_running_claim(
+                    tracker,
+                    store.clone(),
+                    &manager,
+                    &claim.id,
+                    &worker.id,
+                    run_id,
+                    Some("runtimeInterrupted"),
+                    "Golazo restarted while the Codex worker run was active",
+                    now,
+                )?;
+            }
+            claims
+                .cancel_claim(
+                    &claim.id,
+                    &worker.id,
+                    claim.lease_generation,
+                    CancelEvidence {
+                        reason: "Golazo restarted and no live Codex runtime remained".into(),
+                        evidence_refs: vec!["startup-recovery:missing-live-runtime".into()],
+                    },
+                    &format!("recover-interrupted-runtime:{}", claim.id.as_str()),
+                    now,
+                )
+                .map_err(|error| error.to_string())?;
+            pool.report_worker_failure(
+                &worker.id,
+                WorkerFailureKind::Permanent,
+                "startup recovery found no live Codex runtime",
+                now,
+            )
+            .map_err(|error| error.to_string())?;
+            recovered.push(claim.id);
+            continue;
+        }
         if !never_dispatched || claim.lease_expires_at > now {
             continue;
         }
@@ -212,8 +260,12 @@ async fn dispatch_one(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("worker {} was not found", claim.owner.as_str()))?;
     let worker = if worker.workspace.is_none() {
-        pool.provision_worker_workspace(manager, &worker.id, &claim.base_revision, now)
-            .map_err(|error| error.to_string())?
+        match recover_preserved_workspace(&tracker, store.clone(), manager, &claim, &worker, now)? {
+            Some(recovered) => recovered,
+            None => pool
+                .provision_worker_workspace(manager, &worker.id, &claim.base_revision, now)
+                .map_err(|error| error.to_string())?,
+        }
     } else {
         worker
     };
@@ -255,6 +307,7 @@ async fn dispatch_one(
         runner,
         tracker,
         store,
+        manager.clone(),
         worker.id,
         claim.id,
         claim.lease_generation,
@@ -267,6 +320,7 @@ async fn monitor_run(
     runner: Arc<RunManager>,
     tracker: Tracker,
     store: Arc<SqliteCoordinationStore>,
+    manager: WorktreeManager,
     worker_id: WorkerId,
     claim_id: ClaimId,
     claim_generation: u64,
@@ -282,6 +336,17 @@ async fn monitor_run(
         sleep(MONITOR_INTERVAL).await;
         let now = Utc::now();
         let Some(run) = runner.get(&run_id).await else {
+            let _ = preserve_running_claim(
+                &tracker,
+                store.clone(),
+                &manager,
+                &claim_id,
+                &worker_id,
+                Some(&run_id),
+                None,
+                "Codex run disappeared",
+                now,
+            );
             fail_running_claim(
                 &tracker,
                 store.clone(),
@@ -310,6 +375,17 @@ async fn monitor_run(
                 .heartbeat(&claim_id, &worker_id, claim_generation, now)
                 .is_err()
             {
+                let _ = preserve_running_claim(
+                    &tracker,
+                    store.clone(),
+                    &manager,
+                    &claim_id,
+                    &worker_id,
+                    Some(&run_id),
+                    None,
+                    "claim heartbeat failed",
+                    now,
+                );
                 fail_running_claim(
                     &tracker,
                     store.clone(),
@@ -346,6 +422,17 @@ async fn monitor_run(
                     .clone()
                     .unwrap_or_else(|| "Codex worker run failed".into()),
             };
+            let _ = preserve_running_claim(
+                &tracker,
+                store.clone(),
+                &manager,
+                &claim_id,
+                &worker_id,
+                Some(&run_id),
+                failure_code,
+                &reason,
+                now,
+            );
             fail_running_claim(
                 &tracker,
                 store.clone(),
@@ -376,6 +463,17 @@ async fn monitor_run(
                 )
             });
         if let Err(error) = result {
+            let _ = preserve_running_claim(
+                &tracker,
+                store.clone(),
+                &manager,
+                &claim_id,
+                &worker_id,
+                Some(&run_id),
+                None,
+                &error,
+                now,
+            );
             fail_running_claim(
                 &tracker,
                 store.clone(),
@@ -390,6 +488,167 @@ async fn monitor_run(
         }
         return;
     }
+}
+
+fn recover_preserved_workspace(
+    tracker: &Tracker,
+    store: Arc<SqliteCoordinationStore>,
+    manager: &WorktreeManager,
+    claim: &Claim,
+    replacement_worker: &super::domain::Worker,
+    now: DateTime<Utc>,
+) -> Result<Option<super::domain::Worker>, String> {
+    let Some(mut artifact) = preserved_work_for_scope(tracker, &claim.goal_id, &claim.scope)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let mut source_worker = store
+        .worker(&artifact.source_worker_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "preserved work references a missing source worker".to_string())?;
+    validate_recovery_candidate(
+        store.clone(),
+        manager,
+        &artifact,
+        claim,
+        &source_worker,
+        replacement_worker,
+    )
+    .map_err(|error| error.to_string())?;
+    let expected_source_updated_at = source_worker.metadata.updated_at;
+    let expected_replacement_updated_at = replacement_worker.metadata.updated_at;
+    let mut replacement_worker = replacement_worker.clone();
+    source_worker.workspace = None;
+    source_worker.metadata.touch(now);
+    let mut workspace = artifact.workspace.clone();
+    workspace
+        .creation_evidence
+        .push(format!("recovered-partial-work:{}", artifact.id));
+    replacement_worker.workspace = Some(workspace);
+    replacement_worker.metadata.touch(now);
+    let event = CoordinationEvent::new(
+        &claim.goal_id,
+        CoordinationEventKind::WorkerLifecycleChanged,
+        EventSeverity::Warning,
+        CoordinationActor::System,
+        claim.id.as_str(),
+        serde_json::json!({
+            "category": "partial_work_recovered",
+            "artifactId": artifact.id,
+            "sourceWorkerId": artifact.source_worker_id,
+            "sourceClaimId": artifact.source_claim_id,
+            "sourceRunId": artifact.source_run_id,
+            "sourceThreadId": artifact.source_thread_id,
+            "failureCode": artifact.failure_code,
+            "failureReason": artifact.failure_reason,
+            "workspace": artifact.workspace.worktree_path,
+            "branch": artifact.workspace.branch,
+            "baseRevision": artifact.workspace.base_revision,
+            "headRevision": artifact.workspace_state.head_revision,
+            "stagedPaths": artifact.workspace_state.staged_paths,
+            "unstagedPaths": artifact.workspace_state.unstaged_paths,
+            "untrackedPaths": artifact.workspace_state.untracked_paths,
+            "conflictedPaths": artifact.workspace_state.conflicted_paths,
+            "unpublishedCommits": artifact.workspace_state.unpublished_commits,
+            "requiredAction": "Inspect preserved changes and rerun validation before editing or integration."
+        }),
+        now,
+    );
+    let transferred = store
+        .transfer_worker_workspace_with_event_if_revisions(
+            &source_worker,
+            expected_source_updated_at,
+            &replacement_worker,
+            expected_replacement_updated_at,
+            claim,
+            &event,
+            &format!("partial-work.recover:{}", artifact.id),
+        )
+        .map_err(|error| error.to_string())?;
+    if transferred.is_none() {
+        return Err("worker or claim changed during partial-work recovery".into());
+    }
+    if let Err(error) = mark_recovered(tracker, &mut artifact, claim, &replacement_worker, now) {
+        let event = CoordinationEvent::new(
+            &claim.goal_id,
+            CoordinationEventKind::WorkerLifecycleChanged,
+            EventSeverity::Error,
+            CoordinationActor::System,
+            claim.id.as_str(),
+            serde_json::json!({
+                "category": "partial_work_artifact_update_failed",
+                "artifactId": artifact.id,
+                "error": error.to_string(),
+                "workspaceOwnershipTransferred": true,
+            }),
+            now,
+        );
+        let _ = store.append_event(&event);
+    }
+    Ok(Some(replacement_worker))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preserve_running_claim(
+    tracker: &Tracker,
+    store: Arc<SqliteCoordinationStore>,
+    manager: &WorktreeManager,
+    claim_id: &ClaimId,
+    worker_id: &WorkerId,
+    run_id: Option<&str>,
+    failure_code: Option<&str>,
+    failure_reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let worker = store
+        .worker(worker_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("worker {} was not found", worker_id.as_str()))?;
+    let claim = store
+        .claim(claim_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("claim {} was not found", claim_id.as_str()))?;
+    let Some(artifact) = preserve_failed_work(
+        tracker,
+        store.clone(),
+        manager,
+        &worker,
+        &claim,
+        run_id,
+        failure_code,
+        failure_reason,
+        now,
+    )
+    .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    let event = CoordinationEvent::new(
+        &claim.goal_id,
+        CoordinationEventKind::WorkerLifecycleChanged,
+        EventSeverity::Warning,
+        CoordinationActor::System,
+        claim.id.as_str(),
+        serde_json::json!({
+            "category": "partial_work_preserved",
+            "artifactId": artifact.id,
+            "workerId": worker.id,
+            "workspace": artifact.workspace.worktree_path,
+            "branch": artifact.workspace.branch,
+            "dirtyPathCount": artifact.workspace_state.staged_paths.len()
+                + artifact.workspace_state.unstaged_paths.len()
+                + artifact.workspace_state.untracked_paths.len()
+                + artifact.workspace_state.conflicted_paths.len(),
+            "unpublishedCommits": artifact.workspace_state.unpublished_commits,
+            "failureCode": artifact.failure_code,
+        }),
+        now,
+    );
+    store
+        .append_event(&event)
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn complete_worker_run(
@@ -665,33 +924,34 @@ fn drain_integration_queue(
             .and_then(|worker| worker.workspace)
             .map(|binding| binding.canonical_repository_path)
             .ok_or_else(|| "worker workspace binding is missing".to_string())?;
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&repository)
-            .args(["cherry-pick", &artifact.head_revision])
-            .output()
-            .map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(&repository)
-                .args(["cherry-pick", "--abort"])
-                .output();
-            queue
-                .finish(&job.id, false, "automatic cherry-pick failed", now)
-                .map_err(|error| error.to_string())?;
-            return Err(format!(
-                "automatic cherry-pick failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let integration_revision = resolve_base_revision(Path::new(&repository), Some("HEAD"))?;
+        let delivery = match integrate_and_publish(
+            tracker,
+            Path::new(&repository),
+            &artifact.goal_id,
+            &artifact.head_revision,
+            now,
+        ) {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                queue
+                    .finish(&job.id, false, &error.to_string(), now)
+                    .map_err(|error| error.to_string())?;
+                return Err(error.to_string());
+            }
+        };
+        let integration_revision = delivery.head_revision.clone();
         let summary = artifact
             .evidence_refs
             .iter()
             .find_map(|reference| reference.strip_prefix("worker-summary:"))
             .unwrap_or("Worker slice validated and integrated")
             .to_string();
+        let mut final_evidence = artifact.evidence_refs.clone();
+        final_evidence.push(format!("goal-branch:{}", delivery.integration_branch));
+        final_evidence.push(format!("delivery-status:{:?}", delivery.status).to_lowercase());
+        if let Some(url) = &delivery.pull_request_url {
+            final_evidence.push(format!("pull-request:{url}"));
+        }
         IntegrationFinalizationService::new(store.clone(), tracker.clone())
             .finalize(
                 IntegrationFinalizationRequest {
@@ -700,12 +960,40 @@ fn drain_integration_queue(
                     tracker_feature_id: feature_id,
                     tracker_step_ids: step_ids,
                     tracker_summary: summary,
-                    tracker_evidence: artifact.evidence_refs.clone(),
+                    tracker_evidence: final_evidence,
                     tracker_status: Status::Partial,
                     integration_revision,
                 },
                 Utc::now(),
             )
+            .map_err(|error| error.to_string())?;
+        let severity = if delivery.status == GoalDeliveryStatus::NeedsAttention {
+            EventSeverity::Warning
+        } else {
+            EventSeverity::Info
+        };
+        let event = CoordinationEvent::new(
+            artifact.goal_id.clone(),
+            CoordinationEventKind::IntegrationChanged,
+            severity,
+            CoordinationActor::System,
+            format!("goal-delivery:{}", artifact.goal_id),
+            json!({
+                "category": "goal_delivery_updated",
+                "integrationBranch": delivery.integration_branch,
+                "targetBranch": delivery.target_branch,
+                "mergePolicy": delivery.merge_policy,
+                "status": delivery.status,
+                "headRevision": delivery.head_revision,
+                "pushedRevision": delivery.pushed_revision,
+                "pullRequestNumber": delivery.pull_request_number,
+                "pullRequestUrl": delivery.pull_request_url,
+                "lastError": delivery.last_error,
+            }),
+            now,
+        );
+        store
+            .append_event(&event)
             .map_err(|error| error.to_string())?;
     }
 }
@@ -957,6 +1245,106 @@ mod tests {
     }
 
     #[test]
+    fn restart_recovery_revokes_orphaned_claim_and_preserves_dirty_workspace() {
+        let directory = TempDir::new().unwrap();
+        let repository = directory.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q"]);
+        git(&repository, &["config", "user.email", "test@example.com"]);
+        git(&repository, &["config", "user.name", "Test"]);
+        fs::write(repository.join("README.md"), "before\n").unwrap();
+        git(&repository, &["add", "README.md"]);
+        git(&repository, &["commit", "-q", "-m", "initial"]);
+
+        let tracker = Tracker::new(repository.join(".goal-manager"));
+        tracker.create_goal("goal-a", "Goal A", "recovery").unwrap();
+        tracker
+            .add_feature(
+                "goal-a",
+                "feature-a",
+                "Feature A",
+                "runtime recovery",
+                Status::Planned,
+            )
+            .unwrap();
+        let store = Arc::new(
+            SqliteCoordinationStore::open(repository.join(".goal-manager/coordination.sqlite"))
+                .unwrap(),
+        );
+        let now = Utc::now();
+        let manager = WorktreeManager::open(&repository).unwrap();
+        let mut worker = Worker::new("goal-a", now);
+        worker.transition(WorkerState::Starting, now, None).unwrap();
+        worker.transition(WorkerState::Active, now, None).unwrap();
+        worker.workspace = Some(
+            manager
+                .create_for_worker("goal-a", &worker.id, "HEAD", now)
+                .unwrap(),
+        );
+        let claim = Claim::new(
+            "goal-a",
+            ClaimScope::Feature {
+                feature_id: "feature-a".into(),
+            },
+            worker.id.clone(),
+            worker.workspace.as_ref().unwrap().base_revision.clone(),
+            now,
+            now + Duration::minutes(5),
+        )
+        .unwrap();
+        worker.active_claims.push(claim.id.clone());
+        store.upsert_worker(&worker).unwrap();
+        store.insert_claim(&claim).unwrap();
+        let pool = WorkerPoolService::load(store.clone(), WorkerPoolPolicy::default()).unwrap();
+        pool.begin_turn(&worker.id, "lost-run", "lost-thread", None, None, now)
+            .unwrap();
+        let mut interrupted = store.worker(&worker.id).unwrap().unwrap();
+        interrupted
+            .transition(
+                WorkerState::Recovering,
+                now + Duration::seconds(1),
+                Some("restart".into()),
+            )
+            .unwrap();
+        interrupted.current_run_id = None;
+        store.upsert_worker(&interrupted).unwrap();
+        fs::write(
+            Path::new(&interrupted.workspace.as_ref().unwrap().worktree_path).join("partial.txt"),
+            "preserve me\n",
+        )
+        .unwrap();
+
+        let recovered = recover_unstarted_claims(
+            &tracker,
+            store.clone(),
+            "goal-a",
+            now + Duration::seconds(2),
+        )
+        .unwrap();
+
+        assert_eq!(recovered, vec![claim.id.clone()]);
+        assert_eq!(
+            store.claim(&claim.id).unwrap().unwrap().state,
+            ClaimState::Revoked
+        );
+        assert_eq!(
+            store.worker(&worker.id).unwrap().unwrap().state,
+            WorkerState::Failed
+        );
+        let artifacts =
+            crate::coordination::recovery_artifacts::partial_work_for_goal(&tracker, "goal-a")
+                .unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].source_claim_id, claim.id);
+        assert!(
+            artifacts[0]
+                .workspace_state
+                .untracked_paths
+                .contains(&"partial.txt".into())
+        );
+    }
+
+    #[test]
     fn preserves_codex_failure_code_in_claim_and_worker_outcomes() {
         let directory = TempDir::new().unwrap();
         let tracker = Tracker::new(directory.path().join("goals"));
@@ -1026,5 +1414,207 @@ mod tests {
                 .reason
                 .contains("usageLimitExceeded")
         );
+    }
+
+    #[test]
+    fn replacement_worker_reclaims_preserved_dirty_workspace_with_fresh_lease() {
+        let directory = TempDir::new().unwrap();
+        let repository = directory.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q"]);
+        git(&repository, &["config", "user.email", "test@example.com"]);
+        git(&repository, &["config", "user.name", "Test"]);
+        fs::write(repository.join("README.md"), "before\n").unwrap();
+        git(&repository, &["add", "README.md"]);
+        git(&repository, &["commit", "-q", "-m", "initial"]);
+        let base = resolve_base_revision(&repository, Some("HEAD")).unwrap();
+        let tracker = Tracker::new(repository.join(".goal-manager"));
+        tracker.create_goal("goal-a", "Goal A", "recovery").unwrap();
+        tracker
+            .add_feature(
+                "goal-a",
+                "feature-a",
+                "Feature A",
+                "recover partial work",
+                Status::Planned,
+            )
+            .unwrap();
+        tracker
+            .add_step("goal-a", "feature-a", "step-a", "Step A", false, true)
+            .unwrap();
+        let store = Arc::new(
+            SqliteCoordinationStore::open(tracker.root.join("coordination.sqlite")).unwrap(),
+        );
+        let manager = WorktreeManager::open(&repository).unwrap();
+        let now = Utc::now();
+        let mut source = Worker::new("goal-a", now);
+        source.transition(WorkerState::Starting, now, None).unwrap();
+        source.transition(WorkerState::Active, now, None).unwrap();
+        source.permission_profile = Some(Default::default());
+        source.workspace = Some(
+            manager
+                .create_for_worker("goal-a", &source.id, &base, now)
+                .unwrap(),
+        );
+        let source_claim = Claim::new(
+            "goal-a",
+            ClaimScope::Feature {
+                feature_id: "feature-a".into(),
+            },
+            source.id.clone(),
+            &base,
+            now,
+            now + Duration::minutes(5),
+        )
+        .unwrap();
+        source.active_claims.push(source_claim.id.clone());
+        store.upsert_worker(&source).unwrap();
+        store.insert_claim(&source_claim).unwrap();
+        let pool = WorkerPoolService::load(store.clone(), WorkerPoolPolicy::default()).unwrap();
+        pool.begin_turn(&source.id, "run-failed", "thread-failed", None, None, now)
+            .unwrap();
+        fs::write(
+            Path::new(&source.workspace.as_ref().unwrap().worktree_path).join("partial.txt"),
+            "preserved edit\n",
+        )
+        .unwrap();
+
+        preserve_running_claim(
+            &tracker,
+            store.clone(),
+            &manager,
+            &source_claim.id,
+            &source.id,
+            Some("run-failed"),
+            Some("usageLimitExceeded"),
+            "usage limit reached",
+            now,
+        )
+        .unwrap();
+        fail_running_claim(
+            &tracker,
+            store.clone(),
+            &pool,
+            &source_claim.id,
+            &source.id,
+            source_claim.lease_generation,
+            "usage limit reached",
+            Some("usageLimitExceeded"),
+            now,
+        );
+
+        let mut replacement = Worker::new("goal-a", now + Duration::seconds(1));
+        replacement
+            .transition(WorkerState::Starting, now + Duration::seconds(1), None)
+            .unwrap();
+        replacement
+            .transition(WorkerState::Active, now + Duration::seconds(1), None)
+            .unwrap();
+        replacement.permission_profile = Some(Default::default());
+        let mut replacement_claim = Claim::new(
+            "goal-a",
+            source_claim.scope.clone(),
+            replacement.id.clone(),
+            &base,
+            now + Duration::seconds(1),
+            now + Duration::minutes(5),
+        )
+        .unwrap();
+        replacement_claim.lease_generation = source_claim.lease_generation + 1;
+        replacement.active_claims.push(replacement_claim.id.clone());
+        store.upsert_worker(&replacement).unwrap();
+        store.insert_claim(&replacement_claim).unwrap();
+
+        let recovered = recover_preserved_workspace(
+            &tracker,
+            store.clone(),
+            &manager,
+            &replacement_claim,
+            &replacement,
+            now + Duration::seconds(1),
+        )
+        .unwrap()
+        .unwrap();
+        let recovered_workspace = recovered.workspace.unwrap();
+        assert_eq!(
+            fs::read_to_string(Path::new(&recovered_workspace.worktree_path).join("partial.txt"))
+                .unwrap(),
+            "preserved edit\n"
+        );
+        assert!(
+            recovered_workspace
+                .creation_evidence
+                .iter()
+                .any(|evidence| evidence.starts_with("recovered-partial-work:"))
+        );
+        assert!(
+            store
+                .worker(&source.id)
+                .unwrap()
+                .unwrap()
+                .workspace
+                .is_none()
+        );
+        let artifacts =
+            crate::coordination::recovery_artifacts::partial_work_for_goal(&tracker, "goal-a")
+                .unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifacts[0].state,
+            crate::coordination::recovery_artifacts::PartialWorkArtifactState::Recovered
+        );
+        assert_eq!(
+            artifacts[0]
+                .recovery
+                .as_ref()
+                .map(|recovery| &recovery.claim_id),
+            Some(&replacement_claim.id)
+        );
+        assert_eq!(
+            artifacts[0].source_thread_id.as_deref(),
+            Some("thread-failed")
+        );
+        let events = store
+            .latest_events_for_goal("goal-a", Some(replacement_claim.id.as_str()), 10)
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.payload.get("category").and_then(Value::as_str) == Some("partial_work_recovered")
+        }));
+
+        complete_worker_run(
+            &tracker,
+            store.clone(),
+            &replacement.id,
+            &replacement_claim.id,
+            replacement_claim.lease_generation,
+            WorkerCompletion {
+                summary: "Recovered and completed partial work".into(),
+                completed_step_ids: vec!["step-a".into()],
+                validation_commands: vec!["git diff --check".into()],
+                evidence_refs: vec!["partial-work-recovery-test".into()],
+                known_risks: vec![],
+            },
+            now + Duration::seconds(2),
+        )
+        .unwrap();
+        assert!(!repository.join("partial.txt").exists());
+        assert_eq!(
+            git_output(&repository, &["show", "codex/goal-goal-a:partial.txt"]).unwrap(),
+            "preserved edit"
+        );
+        let delivery = crate::coordination::delivery::read_state(&tracker, "goal-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.integration_branch, "codex/goal-goal-a");
+        assert_eq!(
+            delivery.status,
+            crate::coordination::delivery::GoalDeliveryStatus::Local
+        );
+        assert_eq!(
+            store.claim(&replacement_claim.id).unwrap().unwrap().state,
+            ClaimState::Completed
+        );
+        let goal = tracker.get_goal("goal-a").unwrap();
+        assert_eq!(goal["features"][0]["steps"][0]["done"], true);
     }
 }
