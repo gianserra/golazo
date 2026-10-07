@@ -5,11 +5,11 @@ use super::claims::{
 use super::contracts::{ContractRegistry, ContractRegistryError};
 use super::domain::{
     ActivityCategory, ActivityEventPayload, BlockerEventPayload, Claim, ClaimId, ClaimScope,
-    ClaimState, CompletionEventPayload, ContractEventPayload, ContractExpectation, ContractId,
-    CoordinationActor, CoordinationEvent, CoordinationEventKind, CoordinationEventPayload,
-    CoordinationExchange, CoordinationRequestEventPayload, DomainError, EscalationId, EventId,
-    EventSeverity, ExchangeId, NotificationId, NotificationState, SharedContract, Worker, WorkerId,
-    WorkerNotification, WorkerPermissionProfile, WorkerState, WorkerTurnBinding, WorkspaceBinding,
+    ClaimState, ContractEventPayload, ContractId, CoordinationActor, CoordinationEvent,
+    CoordinationEventKind, CoordinationEventPayload, CoordinationExchange,
+    CoordinationRequestEventPayload, DomainError, EscalationId, EventId, EventSeverity, ExchangeId,
+    NotificationId, NotificationState, SharedContract, Worker, WorkerId, WorkerNotification,
+    WorkerPermissionProfile, WorkerState, WorkerTurnBinding, WorkspaceBinding,
 };
 use super::notifications::{
     CoordinationExchangeError, CoordinationExchangeService, CoordinationRequestError,
@@ -2580,8 +2580,8 @@ fn hash_json(value: &serde_json::Value) -> Result<String, serde_json::Error> {
 mod tests {
     use super::*;
     use crate::coordination::domain::{
-        Claim, CoordinationActor, CoordinationEventKind, EventId, EventSeverity, Worker,
-        WorkerState,
+        Claim, CompletionEventPayload, ContractExpectation, CoordinationActor,
+        CoordinationEventKind, EventId, EventSeverity, Worker, WorkerState,
     };
     use crate::coordination::store::{
         ClaimRepository, EventRepository, ExchangeRepository, NotificationRepository,

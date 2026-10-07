@@ -1,4 +1,4 @@
-use super::domain::{EventSeverity, InterventionLevel};
+use super::domain::InterventionLevel;
 use serde::{Deserialize, Serialize};
 
 pub const SUPERVISOR_EVALS_JSON: &str = include_str!("fixtures/supervisor-evals.json");
@@ -35,7 +35,7 @@ pub fn supervisor_eval_cases() -> Result<Vec<SupervisorEvalCase>, serde_json::Er
 mod tests {
     use super::*;
     use crate::coordination::domain::{
-        EventId, InterventionId, InterventionState, SignalId, WorkerId, WorkerState,
+        EventId, EventSeverity, InterventionId, InterventionState, SignalId, WorkerId, WorkerState,
     };
     use crate::coordination::supervisor::{
         SupervisorContextPacket, SupervisorEventContext, SupervisorInterventionContext,

@@ -1,7 +1,8 @@
 use super::domain::*;
+use super::recovery_artifacts::{PartialWorkArtifactState, partial_work_for_goal};
 use super::store::{
-    ClaimRepository, EscalationRepository, EventRepository, IdempotencyRepository,
-    SqliteCoordinationStore, StoreError, WorkPackageRepository, WorkerRepository,
+    ClaimRepository, EscalationRepository, IdempotencyRepository, SqliteCoordinationStore,
+    StoreError, WorkPackageRepository, WorkerRepository,
 };
 use crate::tracker::{Tracker, TrackerError};
 use chrono::{DateTime, Duration, Utc};
@@ -94,6 +95,8 @@ pub enum ClaimServiceError {
     CompletionEvidenceRequired,
     #[error("claim completion is not allowed before its integration boundary is satisfied")]
     IntegrationBoundaryNotSatisfied,
+    #[error("partial-work recovery inventory failed: {0}")]
+    RecoveryInventory(String),
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +177,13 @@ impl ClaimService {
                 scopes.push(scope);
             }
         }
+        let preserved = partial_work_for_goal(&self.tracker, goal_id)
+            .map_err(|error| ClaimServiceError::RecoveryInventory(error.to_string()))?
+            .into_iter()
+            .filter(|artifact| artifact.state == PartialWorkArtifactState::Preserved)
+            .map(|artifact| artifact.scope)
+            .collect::<Vec<_>>();
+        scopes.sort_by_key(|scope| !preserved.contains(scope));
         Ok(scopes)
     }
 
@@ -920,6 +930,7 @@ fn scope_from_ready_item(item: &Value) -> Option<ClaimScope> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination::store::EventRepository;
     use crate::models::{IntegrationScope, Status};
     use std::sync::Barrier;
     use std::thread;

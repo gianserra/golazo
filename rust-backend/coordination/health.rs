@@ -4,9 +4,9 @@ use super::domain::{
 };
 use super::pool::PoolMode;
 use super::store::{
-    ClaimRepository, EscalationRepository, EventRepository, IntegrationArtifactRepository,
-    IntegrationJobRepository, InterventionRepository, NotificationRepository, PoolRepository,
-    SqliteCoordinationStore, StoreError, WorkerRepository,
+    ClaimRepository, EscalationRepository, EventRepository, IntegrationJobRepository,
+    InterventionRepository, NotificationRepository, PoolRepository, SqliteCoordinationStore,
+    StoreError, WorkerRepository,
 };
 use crate::tracker::{Tracker, TrackerError};
 use chrono::{DateTime, Utc};
@@ -705,6 +705,7 @@ mod tests {
     };
     use crate::coordination::integration::IntegrationQueueService;
     use crate::coordination::pool::GoalPoolState;
+    use crate::coordination::store::IntegrationArtifactRepository;
     use crate::models::Status;
     use chrono::Duration;
 

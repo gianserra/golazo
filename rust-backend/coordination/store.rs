@@ -1326,6 +1326,87 @@ impl SqliteCoordinationStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn transfer_worker_workspace_with_event_if_revisions(
+        &self,
+        source_worker: &Worker,
+        expected_source_updated_at: DateTime<Utc>,
+        replacement_worker: &Worker,
+        expected_replacement_updated_at: DateTime<Utc>,
+        claim: &Claim,
+        event: &CoordinationEvent,
+        publication_key: &str,
+    ) -> Result<Option<u64>, StoreError> {
+        self.with_immediate_transaction(|transaction| {
+            let active_claims: i64 = transaction.query_row(
+                r#"SELECT COUNT(*) FROM claims
+                   WHERE id = ?1 AND owner_id = ?2 AND state = 'active'
+                     AND lease_generation = ?3"#,
+                params![
+                    claim.id.as_str(),
+                    replacement_worker.id.as_str(),
+                    claim.lease_generation,
+                ],
+                |row| row.get(0),
+            )?;
+            if active_claims != 1 {
+                return Ok(None);
+            }
+            let matching_workers: i64 = transaction.query_row(
+                r#"SELECT COUNT(*) FROM workers
+                   WHERE (id = ?1 AND updated_at = ?2)
+                      OR (id = ?3 AND updated_at = ?4)"#,
+                params![
+                    source_worker.id.as_str(),
+                    updated_at(expected_source_updated_at),
+                    replacement_worker.id.as_str(),
+                    updated_at(expected_replacement_updated_at),
+                ],
+                |row| row.get(0),
+            )?;
+            if matching_workers != 2 {
+                return Ok(None);
+            }
+            let source_changed = transaction.execute(
+                r#"UPDATE workers
+                   SET goal_id = ?1, state = ?2, updated_at = ?3, data = ?4
+                   WHERE id = ?5 AND updated_at = ?6"#,
+                params![
+                    source_worker.goal_id,
+                    enum_key(&source_worker.state)?,
+                    updated_at(source_worker.metadata.updated_at),
+                    encode(source_worker)?,
+                    source_worker.id.as_str(),
+                    updated_at(expected_source_updated_at),
+                ],
+            )?;
+            if source_changed != 1 {
+                return Err(StoreError::Integrity(
+                    "source worker changed during workspace recovery".into(),
+                ));
+            }
+            let replacement_changed = transaction.execute(
+                r#"UPDATE workers
+                   SET goal_id = ?1, state = ?2, updated_at = ?3, data = ?4
+                   WHERE id = ?5 AND updated_at = ?6"#,
+                params![
+                    replacement_worker.goal_id,
+                    enum_key(&replacement_worker.state)?,
+                    updated_at(replacement_worker.metadata.updated_at),
+                    encode(replacement_worker)?,
+                    replacement_worker.id.as_str(),
+                    updated_at(expected_replacement_updated_at),
+                ],
+            )?;
+            if replacement_changed != 1 {
+                return Err(StoreError::Integrity(
+                    "replacement worker changed during workspace recovery".into(),
+                ));
+            }
+            append_event_transaction(transaction, event, Some(publication_key)).map(Some)
+        })
+    }
+
     pub fn acquire_claim_for_worker_with_event(
         &self,
         claim: &Claim,

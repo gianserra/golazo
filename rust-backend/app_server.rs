@@ -141,24 +141,21 @@ impl AppServerClient {
         Ok(())
     }
 
-    pub async fn fork_thread(
+    pub async fn start_thread(
         &self,
         workspace: &Path,
-        thread_id: &str,
         application_context: &str,
         config: &LLMConfig,
     ) -> Result<String, String> {
         let response: Value = self
             .request(
-                "thread/fork",
+                "thread/start",
                 json!({
-                    "threadId": thread_id,
                     "cwd": workspace,
                     "developerInstructions": application_context,
                     "model": optional_string(&config.model),
                     "serviceTier": if matches!(config.speed, SpeedMode::Fast) { Some("fast") } else { None },
-                    "deferGoalContinuation": true,
-                    "excludeTurns": true
+                    "ephemeral": false
                 }),
             )
             .await?;
@@ -166,7 +163,7 @@ impl AppServerClient {
             .pointer("/thread/id")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| "thread/fork returned no thread id".to_string())
+            .ok_or_else(|| "thread/start returned no thread id".to_string())
     }
 
     pub async fn start_turn(
@@ -536,6 +533,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redaction::REDACTED_CREDENTIAL;
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
@@ -699,10 +697,10 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn forks_a_thread_with_replacement_mode_instructions() {
+    async fn starts_a_thread_with_replacement_mode_instructions() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("fake-codex");
-        let capture = temp.path().join("fork-request.json");
+        let capture = temp.path().join("start-request.json");
         fs::write(
             &executable,
             format!(
@@ -715,25 +713,19 @@ mod tests {
         let client = AppServerClient::new(executable.to_string_lossy());
 
         let continued = client
-            .fork_thread(
-                temp.path(),
-                "thread-spec",
-                "Build mode guidance",
-                &LLMConfig::default(),
-            )
+            .start_thread(temp.path(), "Build mode guidance", &LLMConfig::default())
             .await
             .unwrap();
 
         assert_eq!(continued, "thread-build");
         let request: Value = serde_json::from_str(&fs::read_to_string(capture).unwrap()).unwrap();
-        assert_eq!(request["method"], "thread/fork");
-        assert_eq!(request["params"]["threadId"], "thread-spec");
+        assert_eq!(request["method"], "thread/start");
+        assert!(request["params"].get("threadId").is_none());
         assert_eq!(
             request["params"]["developerInstructions"],
             "Build mode guidance"
         );
-        assert_eq!(request["params"]["deferGoalContinuation"], true);
-        assert_eq!(request["params"]["excludeTurns"], true);
+        assert_eq!(request["params"]["ephemeral"], false);
     }
 
     #[cfg(unix)]
@@ -761,16 +753,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            event.params["OPENAI_API_KEY"],
-            crate::coordination::security::REDACTED_CREDENTIAL
-        );
+        assert_eq!(event.params["OPENAI_API_KEY"], REDACTED_CREDENTIAL);
         assert_eq!(
             event.params["message"],
-            format!(
-                "GITHUB_TOKEN={}",
-                crate::coordination::security::REDACTED_CREDENTIAL
-            )
+            format!("GITHUB_TOKEN={}", REDACTED_CREDENTIAL)
         );
         assert!(!event.params.to_string().contains("sensitive"));
     }

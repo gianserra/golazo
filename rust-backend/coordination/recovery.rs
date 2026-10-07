@@ -1,11 +1,11 @@
 use super::claims::{ClaimPolicy, ClaimService, ClaimServiceError};
 use super::domain::{WorkerId, WorkspaceBinding};
+use super::execution::{dispatch_claims, recover_unstarted_claims};
 use super::pool::{
     PoolRecoveryReport, RuntimeInventory, WorkerPoolError, WorkerPoolPolicy, WorkerPoolService,
 };
 use super::store::{
-    ClaimRepository, IntegrationArtifactRepository, IntegrationJobRepository, PoolRepository,
-    SqliteCoordinationStore, StoreError, WorkerRepository,
+    ClaimRepository, PoolRepository, SqliteCoordinationStore, StoreError, WorkerRepository,
 };
 use super::workspace::{WorkspaceQuarantineRecord, WorkspaceReconciliation, WorktreeManager};
 use crate::observability::CorrelationIds;
@@ -30,6 +30,8 @@ pub enum StartupRecoveryError {
     Pool(#[from] WorkerPoolError),
     #[error(transparent)]
     Claims(#[from] ClaimServiceError),
+    #[error("worker runtime recovery failed: {0}")]
+    RuntimeRecovery(String),
     #[error("startup recovery report serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("startup recovery report I/O failed: {0}")]
@@ -114,7 +116,7 @@ impl StartupRecoveryService {
                 .cloned()
                 .collect(),
         };
-        let (_, pool) = WorkerPoolService::recover(
+        let (pool_service, pool) = WorkerPoolService::recover(
             Arc::clone(&self.store),
             WorkerPoolPolicy::default(),
             &inventory,
@@ -131,9 +133,43 @@ impl StartupRecoveryService {
             ClaimPolicy::default(),
         );
         let mut expired_claim_ids = Vec::new();
+        let mut warnings = Vec::new();
         for goal_id in &goal_ids {
             if !tracker.validated_goal_ids.contains(goal_id) {
                 continue;
+            }
+            let recovered_claim_ids = recover_unstarted_claims(
+                &self.tracker,
+                Arc::clone(&self.store),
+                goal_id,
+                started_at,
+            )
+            .map_err(StartupRecoveryError::RuntimeRecovery)?;
+            if !recovered_claim_ids.is_empty() {
+                let base_revision = recovered_claim_ids
+                    .iter()
+                    .find_map(|claim_id| self.store.claim(claim_id).ok().flatten())
+                    .map(|claim| claim.base_revision)
+                    .unwrap_or_else(|| "HEAD".into());
+                let assigned =
+                    pool_service.fill_ready_claims(&claims, goal_id, &base_revision, started_at)?;
+                if !assigned.is_empty() {
+                    let execution = dispatch_claims(
+                        Arc::clone(&self.runner),
+                        self.tracker.clone(),
+                        Arc::clone(&self.store),
+                        self.repository_root.clone(),
+                        assigned,
+                        recovered_claim_ids,
+                    )
+                    .await;
+                    warnings.extend(
+                        execution
+                            .failures
+                            .into_iter()
+                            .map(|failure| format!("Worker restart recovery failed: {failure}")),
+                    );
+                }
             }
             expired_claim_ids.extend(
                 claims
@@ -152,7 +188,6 @@ impl StartupRecoveryService {
             .collect::<Vec<_>>();
         requeued_integration_job_ids.sort();
 
-        let mut warnings = Vec::new();
         if let Some(error) = &runner.thread_inventory_error {
             warnings.push(format!("Codex thread inventory unavailable: {error}"));
         }
@@ -326,6 +361,9 @@ mod tests {
     };
     use crate::coordination::integration::IntegrationQueueService;
     use crate::coordination::pool::{GoalPoolState, PoolMode};
+    use crate::coordination::store::{
+        ClaimRepository, IntegrationArtifactRepository, IntegrationJobRepository,
+    };
     use crate::models::Status;
     use serde_json::json;
     use std::process::Command;
@@ -506,7 +544,7 @@ mod tests {
         assert_eq!(report.tracker.validated_goal_ids, vec!["goal-a"]);
         assert_eq!(report.runner.interrupted_run_ids, vec!["run-interrupted"]);
         assert!(report.runner.thread_inventory_error.is_some());
-        assert_eq!(report.expired_claim_ids, vec![claim.id.as_str()]);
+        assert!(report.expired_claim_ids.is_empty());
         assert_eq!(
             report.requeued_integration_job_ids,
             vec![queued.id.as_str()]
@@ -516,8 +554,13 @@ mod tests {
         assert!(report_path.is_file());
         assert_eq!(
             store.claim(&claim.id).unwrap().unwrap().state,
-            super::super::domain::ClaimState::Expired
+            super::super::domain::ClaimState::Revoked
         );
+        let replacement_claims = store
+            .claims_for_goal("goal-a", Some(super::super::domain::ClaimState::Active))
+            .unwrap();
+        assert_eq!(replacement_claims.len(), 1);
+        assert_ne!(replacement_claims[0].owner, worker.id);
         assert_eq!(
             store.integration_job(&queued.id).unwrap().unwrap().state,
             super::super::domain::IntegrationJobState::Queued

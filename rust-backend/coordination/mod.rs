@@ -7,11 +7,13 @@ mod concurrency_stress;
 #[cfg(test)]
 mod conformance;
 pub mod contracts;
+pub mod delivery;
 pub mod detectors;
 #[cfg(test)]
 mod disaster_recovery;
 pub mod domain;
 pub mod escalations;
+pub mod execution;
 pub mod health;
 pub mod integration;
 pub mod metrics;
@@ -21,6 +23,7 @@ pub mod pool;
 mod property_tests;
 pub mod protocol;
 pub mod recovery;
+pub mod recovery_artifacts;
 pub mod rollout;
 #[cfg(test)]
 mod rollout_scenarios;

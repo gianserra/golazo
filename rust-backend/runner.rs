@@ -6,7 +6,7 @@ use crate::coordination::security::{
 use crate::models::{
     AppServerThread, AppServerThreadPage, CodexAuthAction, CodexAuthStatus, FileAttachmentCreate,
     ImageAttachmentCreate, LLMConfig, LLMProvider, ReasoningLevel, Run, RunFile, RunImage,
-    SpeedMode, Usage, WorkMode, WorkerCredentialIsolation,
+    RunTerminalError, SpeedMode, Usage, WorkMode, WorkerCredentialIsolation,
 };
 use crate::observability::CorrelationIds;
 use crate::redaction::{redact_sensitive_value, redacted_copy};
@@ -31,6 +31,8 @@ struct RunnerState {
     settings_path: PathBuf,
     runs: Vec<Run>,
 }
+const CURRENT_MODE_CONTEXT_VERSION: u32 = 1;
+
 pub struct RunManager {
     state: RwLock<RunnerState>,
     app_server: AppServerClient,
@@ -46,6 +48,113 @@ fn prompt_title(prompt: &str) -> String {
         "Untitled thread".into()
     } else {
         redact_environment_credentials_text(&title.chars().take(80).collect::<String>())
+    }
+}
+
+fn bounded_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+fn codex_error_code(error: &Value) -> Option<String> {
+    match error.get("codexErrorInfo") {
+        Some(Value::String(code)) if !code.trim().is_empty() => Some(code.trim().to_string()),
+        Some(Value::Object(info)) => info.keys().next().cloned(),
+        _ => None,
+    }
+}
+
+fn run_terminal_error(error: Option<&Value>, status: &str) -> RunTerminalError {
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .map(redact_environment_credentials_text)
+        .unwrap_or_else(|| format!("Codex turn ended with status {status}"));
+    let additional_details = error
+        .and_then(|error| error.get("additionalDetails"))
+        .and_then(Value::as_str)
+        .filter(|details| !details.trim().is_empty())
+        .map(redact_environment_credentials_text);
+    RunTerminalError {
+        code: error.and_then(codex_error_code),
+        message,
+        additional_details,
+        retryable: false,
+    }
+}
+
+fn backfill_run_terminal_error(run: &mut Run) {
+    if run.status != "failed" || run.terminal_error.is_some() {
+        return;
+    }
+    let error = run.events.iter().rev().find_map(|event| {
+        let method = event.get("method").and_then(Value::as_str)?;
+        let params = event.get("params")?;
+        match method {
+            "turn/completed" => params.pointer("/turn/error"),
+            "error" if params.get("willRetry").and_then(Value::as_bool) != Some(true) => {
+                params.get("error")
+            }
+            _ => None,
+        }
+    });
+    let Some(error) = error else {
+        return;
+    };
+    let terminal_error = run_terminal_error(Some(error), "failed");
+    run.error = Some(terminal_error.message.clone());
+    run.terminal_error = Some(terminal_error);
+}
+
+fn conversation_item_text(item: &Value) -> Option<(&'static str, String)> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("userMessage") => {
+            let text = item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|content| content.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then(|| ("User", bounded_chars(text.trim(), 2_000)))
+        }
+        Some("agentMessage") => item
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| ("Assistant", bounded_chars(text.trim(), 2_000))),
+        _ => None,
+    }
+}
+
+fn conversation_handoff(thread: &AppServerThread) -> String {
+    let messages = thread
+        .turns
+        .iter()
+        .filter_map(|turn| turn.get("items").and_then(Value::as_array))
+        .flatten()
+        .filter_map(conversation_item_text)
+        .map(|(role, text)| format!("{role}: {text}"))
+        .collect::<Vec<_>>();
+    let mut selected = Vec::new();
+    let mut characters = 0usize;
+    for message in messages.into_iter().rev() {
+        let count = message.chars().count();
+        if characters + count > 12_000 || selected.len() >= 20 {
+            break;
+        }
+        characters += count;
+        selected.push(message);
+    }
+    selected.reverse();
+    if selected.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "## Conversation handoff\n\nThe following bounded transcript is historical context only. Preserve its decisions, but follow the current Golazo mode contract, tracker state, and visible user prompt for the next action.\n\n{}",
+            selected.join("\n\n")
+        )
     }
 }
 
@@ -237,6 +346,10 @@ struct StoredThread {
     goal_id: Option<String>,
     #[serde(default)]
     work_mode: WorkMode,
+    #[serde(default)]
+    mode_context_version: u32,
+    #[serde(default)]
+    continued_from: Option<String>,
     created_at: String,
     #[serde(default)]
     updated_at: String,
@@ -365,7 +478,11 @@ impl RunManager {
             return vec![];
         };
         redact_sensitive_value(&mut value);
-        serde_json::from_value(value).unwrap_or_default()
+        let mut runs: Vec<Run> = serde_json::from_value(value).unwrap_or_default();
+        for run in &mut runs {
+            backfill_run_terminal_error(run);
+        }
+        runs
     }
     async fn save(&self) {
         let (path, runs) = {
@@ -482,6 +599,8 @@ impl RunManager {
                     llm_config: config.clone(),
                     goal_id: goal_id.map(str::to_string),
                     work_mode: work_mode.clone(),
+                    mode_context_version: CURRENT_MODE_CONTEXT_VERSION,
+                    continued_from: None,
                     created_at: timestamp.clone(),
                     updated_at: timestamp,
                 },
@@ -530,6 +649,8 @@ impl RunManager {
                 llm_config: default,
                 goal_id: None,
                 work_mode: WorkMode::default(),
+                mode_context_version: 0,
+                continued_from: None,
                 created_at: now(),
                 updated_at: now(),
             });
@@ -541,6 +662,9 @@ impl RunManager {
             record.llm_config = value;
         }
         if let Some(value) = work_mode {
+            if record.work_mode != value {
+                record.mode_context_version = 0;
+            }
             record.work_mode = value;
         }
         record.updated_at = now();
@@ -565,14 +689,28 @@ impl RunManager {
         let Some(source) = source else {
             return Ok(None);
         };
-        if source.work_mode == work_mode {
+        let mode_context_version = self
+            .load_settings()
+            .await
+            .threads
+            .get(id)
+            .map(|thread| thread.mode_context_version)
+            .unwrap_or_default();
+        if source.work_mode == work_mode && mode_context_version == CURRENT_MODE_CONTEXT_VERSION {
             return Ok(Some(source));
         }
 
         let workspace = self.workspace_root().await;
+        let history = self.app_server_thread(id).await?;
+        let handoff = conversation_handoff(&history);
+        let replacement_instructions = if handoff.is_empty() {
+            developer_instructions.to_string()
+        } else {
+            format!("{developer_instructions}\n\n{handoff}")
+        };
         let continued_id = self
             .app_server
-            .fork_thread(&workspace, id, developer_instructions, &source.llm_config)
+            .start_thread(&workspace, &replacement_instructions, &source.llm_config)
             .await?;
         self.app_server
             .set_thread_name(&continued_id, &source.title)
@@ -587,6 +725,8 @@ impl RunManager {
                 llm_config: source.llm_config,
                 goal_id: source.goal_id,
                 work_mode,
+                mode_context_version: CURRENT_MODE_CONTEXT_VERSION,
+                continued_from: Some(id.to_string()),
                 created_at: timestamp.clone(),
                 updated_at: timestamp,
             },
@@ -672,6 +812,8 @@ impl RunManager {
                 llm_config: default,
                 goal_id: None,
                 work_mode: WorkMode::default(),
+                mode_context_version: 0,
+                continued_from: None,
                 created_at: timestamp.clone(),
                 updated_at: timestamp.clone(),
             });
@@ -724,6 +866,8 @@ impl RunManager {
                     llm_config: default.clone(),
                     goal_id: None,
                     work_mode: WorkMode::default(),
+                    mode_context_version: 0,
+                    continued_from: None,
                     created_at: app_server_time(thread.created_at),
                     updated_at: app_server_time(thread.updated_at),
                 });
@@ -774,6 +918,35 @@ impl RunManager {
             .get(id)
             .and_then(|record| record.goal_id.clone())
             .or(run_goal_id);
+        let mut parent_id = settings
+            .threads
+            .get(id)
+            .and_then(|record| record.continued_from.clone());
+        let mut seen = HashSet::from([id.to_string()]);
+        let mut lineage = Vec::new();
+        for _ in 0..16 {
+            let Some(parent) = parent_id else {
+                break;
+            };
+            if !seen.insert(parent.clone()) {
+                break;
+            }
+            let Ok(parent_thread) = self.app_server.read_thread(&workspace, &parent).await else {
+                break;
+            };
+            lineage.push(parent_thread.turns);
+            parent_id = settings
+                .threads
+                .get(&parent)
+                .and_then(|record| record.continued_from.clone());
+        }
+        if !lineage.is_empty() {
+            let current_turns = std::mem::take(&mut thread.turns);
+            for turns in lineage.into_iter().rev() {
+                thread.turns.extend(turns);
+            }
+            thread.turns.extend(current_turns);
+        }
         redact_app_server_thread(&mut thread);
         Ok(thread)
     }
@@ -1213,6 +1386,7 @@ impl RunManager {
             llm_config: effective_config,
             final_message: None,
             error: None,
+            terminal_error: None,
             usage: Usage::default(),
             events: vec![],
         };
@@ -1471,6 +1645,9 @@ impl RunManager {
                     .is_some_and(|phase| phase == "final_answer");
             let mut durable_params = event.params.clone();
             redact_environment_credentials(&mut durable_params);
+            let terminal_event_error = (event.method == "error"
+                && event.params.get("willRetry").and_then(Value::as_bool) != Some(true))
+            .then(|| run_terminal_error(event.params.get("error"), "failed"));
             self.mutate(&id, |run| {
                 run.events
                     .push(serde_json::json!({"method": event.method, "params": durable_params}));
@@ -1504,6 +1681,10 @@ impl RunManager {
                     run.usage.total_tokens =
                         last.get("totalTokens").and_then(Value::as_i64).unwrap_or(0);
                 }
+                if let Some(error) = terminal_event_error.as_ref() {
+                    run.error = Some(error.message.clone());
+                    run.terminal_error = Some(error.clone());
+                }
             })
             .await;
             if event.method == "turn/completed" {
@@ -1512,6 +1693,9 @@ impl RunManager {
                     .pointer("/turn/status")
                     .and_then(Value::as_str)
                     .unwrap_or("completed");
+                let completed_error = (status != "completed")
+                    .then(|| run_terminal_error(event.params.pointer("/turn/error"), status));
+                let turn_has_error = event.params.pointer("/turn/error").is_some();
                 self.mutate(&id, |run| {
                     run.status = if status == "completed" {
                         "completed".into()
@@ -1521,7 +1705,17 @@ impl RunManager {
                     run.finished_at = Some(now());
                     run.return_code = Some(if status == "completed" { 0 } else { 1 });
                     if status != "completed" {
-                        run.error = Some(format!("Codex turn ended with status {status}"));
+                        let error = if turn_has_error || run.terminal_error.is_none() {
+                            completed_error
+                                .clone()
+                                .unwrap_or_else(|| run_terminal_error(None, status))
+                        } else {
+                            run.terminal_error
+                                .clone()
+                                .unwrap_or_else(|| run_terminal_error(None, status))
+                        };
+                        run.error = Some(error.message.clone());
+                        run.terminal_error = Some(error);
                     }
                 })
                 .await;
@@ -2169,16 +2363,40 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn mode_changes_continue_in_a_forked_thread() {
+    async fn mode_changes_continue_in_a_fresh_thread_with_history_handoff() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
         let executable = temp.path().join("fake-codex");
-        let capture = temp.path().join("fork-request.json");
+        let capture = temp.path().join("start-request.json");
+        let read_response = serde_json::json!({
+            "id": 2,
+            "result": {
+                "thread": {
+                    "id": "thread-spec",
+                    "cwd": workspace,
+                    "preview": "Define the implementation",
+                    "name": "Define the implementation",
+                    "createdAt": 1_700_000_000_i64,
+                    "updatedAt": 1_700_000_100_i64,
+                    "modelProvider": "openai",
+                    "source": "appServer",
+                    "status": "idle",
+                    "turns": [{
+                        "items": [{
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "Keep the accepted architecture"}]
+                        }]
+                    }]
+                }
+            }
+        })
+        .to_string();
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' '{{\"id\":1,\"result\":{{}}}}'\nIFS= read -r line\nIFS= read -r line\nprintf '%s\\n' \"$line\" > '{}'\nprintf '%s\\n' '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-build\"}}}}}}'\nIFS= read -r line\nprintf '%s\\n' '{{\"id\":3,\"result\":{{}}}}'\n",
+                "#!/bin/sh\nIFS= read -r line\nprintf '%s\\n' '{{\"id\":1,\"result\":{{}}}}'\nIFS= read -r line\nIFS= read -r line\nprintf '%s\\n' '{}'\nIFS= read -r line\nprintf '%s\\n' \"$line\" > '{}'\nprintf '%s\\n' '{{\"id\":3,\"result\":{{\"thread\":{{\"id\":\"thread-build\"}}}}}}'\nIFS= read -r line\nprintf '%s\\n' '{{\"id\":4,\"result\":{{}}}}'\n",
+                read_response,
                 capture.display()
             ),
         )
@@ -2214,8 +2432,18 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(settings_path).unwrap()).unwrap();
         assert_eq!(stored["threads"]["thread-spec"]["work_mode"], "spec");
         assert_eq!(stored["threads"]["thread-build"]["work_mode"], "build");
+        assert_eq!(
+            stored["threads"]["thread-build"]["continued_from"],
+            "thread-spec"
+        );
         let request: Value = serde_json::from_str(&fs::read_to_string(capture).unwrap()).unwrap();
-        assert_eq!(request["method"], "thread/fork");
+        assert_eq!(request["method"], "thread/start");
+        assert!(
+            request["params"]["developerInstructions"]
+                .as_str()
+                .unwrap()
+                .contains("Keep the accepted architecture")
+        );
     }
 
     #[cfg(unix)]
@@ -2284,10 +2512,11 @@ mod tests {
         .unwrap();
         #[cfg(unix)]
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let history = temp.path().join("runs.json");
         let manager = RunManager::new(
             workspace,
             executable.to_string_lossy().into(),
-            temp.path().join("runs.json"),
+            history.clone(),
         )
         .await;
         let created = manager
@@ -2418,10 +2647,11 @@ printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-123","tur
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let history = temp.path().join("runs.json");
         let manager = RunManager::new(
             workspace,
             executable.to_string_lossy().into(),
-            temp.path().join("runs.json"),
+            history.clone(),
         )
         .await;
 
@@ -2457,6 +2687,94 @@ printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-123","tur
         assert_eq!(completed.events.len(), 4);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preserves_structured_terminal_app_server_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let executable = temp.path().join("fake-codex");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-123"}}}'
+IFS= read -r line
+printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-123"}}}'
+printf '%s\n' '{"method":"error","params":{"threadId":"thread-123","turnId":"turn-123","willRetry":false,"error":{"codexErrorInfo":"usageLimitExceeded","message":"Usage limit reached","additionalDetails":"reset later"}}}'
+printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-123","turnId":"turn-123","turn":{"status":"failed","error":{"codexErrorInfo":"usageLimitExceeded","message":"Usage limit reached","additionalDetails":"reset later"}}}}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let history = temp.path().join("runs.json");
+        let manager = RunManager::new(
+            workspace,
+            executable.to_string_lossy().into(),
+            history.clone(),
+        )
+        .await;
+
+        let created = manager
+            .create(
+                "Do bounded work".into(),
+                vec![],
+                vec![],
+                ".".into(),
+                "read-only".into(),
+                "on-request".into(),
+                "user".into(),
+                true,
+                None,
+                None,
+                None,
+                None,
+                WorkMode::Build,
+                None,
+            )
+            .await
+            .unwrap();
+        let failed = loop {
+            let run = manager.get(&created.id).await.unwrap();
+            if run.status == "completed" || run.status == "failed" {
+                break run;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.error.as_deref(), Some("Usage limit reached"));
+        assert_eq!(
+            failed.terminal_error,
+            Some(RunTerminalError {
+                code: Some("usageLimitExceeded".into()),
+                message: "Usage limit reached".into(),
+                additional_details: Some("reset later".into()),
+                retryable: false,
+            })
+        );
+
+        let mut legacy = failed;
+        legacy.error = Some("Codex turn ended with status failed".into());
+        legacy.terminal_error = None;
+        tokio::fs::write(&history, serde_json::to_vec(&vec![legacy]).unwrap())
+            .await
+            .unwrap();
+        let reloaded = RunManager::new(temp.path().into(), "codex".into(), history).await;
+        let migrated = reloaded.list().await.pop().unwrap();
+        assert_eq!(migrated.error.as_deref(), Some("Usage limit reached"));
+        assert_eq!(
+            migrated
+                .terminal_error
+                .as_ref()
+                .and_then(|error| error.code.as_deref()),
+            Some("usageLimitExceeded")
+        );
+    }
+
     #[tokio::test]
     async fn redacts_run_history_and_display_projection_without_mutating_live_execution() {
         let temp = tempfile::tempdir().unwrap();
@@ -2487,6 +2805,7 @@ printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-123","tur
             llm_config: LLMConfig::default(),
             final_message: Some("password=final-message-secret".into()),
             error: None,
+            terminal_error: None,
             usage: Usage::default(),
             events: vec![serde_json::json!({
                 "diff": "+ api_key: event-diff-secret",
