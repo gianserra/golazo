@@ -10,7 +10,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceState {
     pub branch: String,
     pub head_revision: String,

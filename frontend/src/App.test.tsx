@@ -3,15 +3,24 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  AssistantMessageContent,
   AutonomousExecutionDisclosure,
   GoalClaimPackageDetails,
   GoalEscalationInbox,
   GoalIntegrationView,
   GoalPoolControls,
   GoalPoolSummaryCard,
+  GoalWorkerDock,
   GoalWorkers,
   api,
   loadGoalPoolSummary,
+  parseWorkerCompletionResult,
+  parseWorkerStructuredUpdate,
+  preservedChatScrollTop,
+  ScrollToLatestButton,
+  sameThreadTurns,
+  unreadResponseDelta,
+  WorkingUpdateContent,
 } from "./App";
 import type {
   Goal,
@@ -52,6 +61,7 @@ function summary(overrides: Partial<GoalPoolSummary> = {}): GoalPoolSummary {
     packages: [],
     contracts: [],
     integrations: [],
+    delivery: null,
     activity: [],
     escalations: [],
     ...overrides,
@@ -74,7 +84,179 @@ describe("API responses", () => {
   });
 });
 
+describe("worker completion presentation", () => {
+  it("renders the structured worker result as a readable summary with technical detail collapsed", () => {
+    const payload = JSON.stringify({
+      completedStepIds: ["harden-finding-contract"],
+      evidenceRefs: ["src/Domain/Finding.cs:3", "dotnet build: succeeded"],
+      knownRisks: ["The trusted integration boundary still needs to run the full test suite."],
+      summary: "Hardened the finding contract and added invariant coverage.",
+      validationCommands: ["dotnet build tests/Domain.Tests/Domain.Tests.csproj", "git diff --check"],
+    });
+    expect(parseWorkerCompletionResult(payload)?.completedStepIds).toEqual(["harden-finding-contract"]);
+    expect(parseWorkerCompletionResult('{"unrelated":true}')).toBeNull();
+
+    render(<AssistantMessageContent text={payload} />);
+    expect(screen.getByText("Worker completed")).toBeTruthy();
+    expect(screen.getByText("Hardened the finding contract and added invariant coverage.")).toBeTruthy();
+    expect(screen.getByText("Harden finding contract")).toBeTruthy();
+    expect(screen.getByText("Verification gaps")).toBeTruthy();
+    expect(screen.getByText("Tests not run")).toBeTruthy();
+    expect(screen.getByText("Validation")).toBeTruthy();
+    expect(screen.getByText("Evidence")).toBeTruthy();
+    expect(screen.getByText("Raw structured result")).toBeTruthy();
+  });
+
+  it("renders a structured working update as progress instead of raw JSON", () => {
+    const payload = JSON.stringify({
+      completedStepIds: [],
+      evidenceRefs: ["src/DocumentSourceAddress.cs", "tests/SourceAddressingTests.cs"],
+      knownRisks: [],
+      summary: "Source-path IDs are implemented and focused validation is starting.",
+      validationCommands: ["dotnet test tests/AbaQa.Domain.Tests/AbaQa.Domain.Tests.csproj"],
+    });
+
+    expect(parseWorkerStructuredUpdate(payload)?.completedStepIds).toEqual([]);
+    expect(parseWorkerCompletionResult(payload)).toBeNull();
+    render(<WorkingUpdateContent text={payload} />);
+    expect(screen.getByText("Worker progress")).toBeTruthy();
+    expect(screen.getByText("Source-path IDs are implemented and focused validation is starting.")).toBeTruthy();
+    expect(screen.getByText("Planned validation")).toBeTruthy();
+    expect(screen.getByText("Evidence so far")).toBeTruthy();
+    expect(screen.getByText("Raw structured update")).toBeTruthy();
+  });
+
+  it("hides incomplete streaming JSON until the structured update is readable", () => {
+    render(<WorkingUpdateContent text={'{"completedStepIds":[],"summary":"Still validating"'} />);
+    expect(screen.getByText("Receiving structured worker update…")).toBeTruthy();
+    expect(screen.queryByText(/completedStepIds/)).toBeNull();
+  });
+
+  it("keeps unchanged polling data stable and preserves a detached reader position", () => {
+    const thread = {
+      id: "thread-1", cwd: "/tmp", preview: "", name: null, createdAt: 1, updatedAt: 1,
+      modelProvider: "openai", source: null, status: "completed",
+      turns: [{ id: "turn-1", status: "completed", items: [{ id: "item-1", type: "agentMessage", text: "Done" }] }],
+      goalId: "goal-1",
+    };
+    expect(sameThreadTurns(thread, { ...thread, updatedAt: 2 })).toBe(true);
+    expect(sameThreadTurns(thread, { ...thread, turns: [...thread.turns, { id: "turn-2", status: "running", items: [] }] })).toBe(false);
+    expect(preservedChatScrollTop(420, 1200, 600)).toBe(420);
+    expect(preservedChatScrollTop(900, 1200, 600)).toBe(600);
+    expect(unreadResponseDelta(2, 4)).toBe(2);
+    expect(unreadResponseDelta(4, 3)).toBe(0);
+  });
+});
+
+describe("conversation scrolling", () => {
+  it("shows unread responses on the explicit latest-message control", () => {
+    const onClick = vi.fn();
+    render(<ScrollToLatestButton unreadCount={3} onClick={onClick} />);
+
+    const button = screen.getByRole("button", { name: "Scroll to latest message, 3 new responses" });
+    expect(screen.getByText("3")).toBeTruthy();
+    fireEvent.click(button);
+    expect(onClick).toHaveBeenCalledOnce();
+  });
+});
+
 describe("worker dashboard", () => {
+  it("prioritizes a live worker dock with expandable details and thread access", async () => {
+    const onOpenThread = vi.fn();
+    const worker: GoalWorkerCardData = {
+      id: "worker-live-001",
+      createdAt: now,
+      updatedAt: now,
+      state: "active",
+      claimId: "claim-live-001",
+      claimLabel: "Document understanding",
+      packageLabel: null,
+      runId: "run-live-001",
+      threadId: "thread-live-001",
+      branch: "golazo/worker-live-001",
+      workspacePath: "/tmp/worktrees/worker-live-001",
+      activity: "Reviewing parser boundaries",
+      activityAt: now,
+      validation: "unknown",
+      lastHeartbeatAt: now,
+      terminationReason: null,
+      failureCode: null,
+      failureMessage: null,
+      recoveryGuidance: null,
+    };
+
+    render(<GoalWorkerDock summary={summary({ workers: [worker] })} loading={false} error={null} onOpenThread={onOpenThread} />);
+
+    expect(screen.getByRole("region", { name: "Live worker pool" })).toBeTruthy();
+    expect(screen.getByText("1 working · no action needed")).toBeTruthy();
+    await waitFor(() => expect(screen.getAllByText("Reviewing parser boundaries")).toHaveLength(2));
+    fireEvent.click(screen.getByRole("button", { name: "Open worker thread" }));
+    expect(onOpenThread).toHaveBeenCalledWith("thread-live-001");
+  });
+
+  it("compresses completed worker activity when the pool is idle", () => {
+    const worker: GoalWorkerCardData = {
+      id: "worker-done-001",
+      createdAt: now,
+      updatedAt: now,
+      state: "completed",
+      claimId: null,
+      claimLabel: "Job lifecycle",
+      packageLabel: null,
+      runId: "run-done-001",
+      threadId: "thread-done-001",
+      branch: "golazo/worker-done-001",
+      workspacePath: "/tmp/worktrees/worker-done-001",
+      activity: "Integrated and verified",
+      activityAt: now,
+      validation: "passed",
+      lastHeartbeatAt: now,
+      terminationReason: null,
+      failureCode: null,
+      failureMessage: null,
+      recoveryGuidance: null,
+    };
+
+    const view = render(<GoalWorkerDock summary={summary({ mode: "stopped", activeWorkers: 0, readyWork: 0, workers: [worker] })} loading={false} error={null} />);
+    const dock = view.container.querySelector("details.worker-pool-dock")! as HTMLDetailsElement;
+    expect(dock.open).toBe(false);
+    expect(screen.getByText("Last worker run")).toBeTruthy();
+    expect(screen.getByText(/1 completed/)).toBeTruthy();
+    fireEvent.click(dock.querySelector(":scope > summary")!);
+    expect(screen.getAllByText("Integrated and verified")).toHaveLength(2);
+  });
+
+  it("labels interrupted workers as recovery work instead of live activity", async () => {
+    const worker: GoalWorkerCardData = {
+      id: "worker-recovering-001",
+      createdAt: now,
+      updatedAt: now,
+      state: "recovering",
+      claimId: "claim-recovering-001",
+      claimLabel: "Semantic review safety",
+      packageLabel: null,
+      runId: "run-interrupted-001",
+      threadId: "thread-interrupted-001",
+      branch: "golazo/worker-recovering-001",
+      workspacePath: "/tmp/worktrees/worker-recovering-001",
+      activity: "Runtime interrupted; Golazo is preserving the workspace and reassigning this claim",
+      activityAt: now,
+      validation: "unknown",
+      lastHeartbeatAt: now,
+      terminationReason: null,
+      failureCode: null,
+      failureMessage: null,
+      recoveryGuidance: null,
+    };
+
+    render(<GoalWorkerDock summary={summary({ activeWorkers: 1, workers: [worker] })} loading={false} error={null} />);
+
+    expect(screen.getByRole("region", { name: "Worker recovery required" })).toBeTruthy();
+    expect(screen.getByText("No worker process is currently running. Golazo is preserving any partial work and assigning replacement workers.")).toBeTruthy();
+    await waitFor(() => expect(screen.getAllByText(/Runtime interrupted/)).toHaveLength(2));
+    expect(screen.queryByRole("region", { name: "Live worker pool" })).toBeNull();
+  });
+
   it("keeps autonomous controls collapsed behind a compact status summary", async () => {
     const onToggle = vi.fn();
     const view = render(
@@ -338,7 +520,24 @@ describe("worker dashboard", () => {
       queuePosition: null,
     };
 
-    const { container } = render(<GoalIntegrationView goalId="dashboard" integrations={[integration]} loading={false} />);
+    const delivery = resource("dashboard", {
+      goalId: "dashboard",
+      integrationBranch: "codex/goal-dashboard",
+      targetBranch: "develop",
+      remote: "origin",
+      mergePolicy: "manual" as const,
+      status: "pull_request_open" as const,
+      integrationWorktree: "/tmp/goal-dashboard",
+      headRevision: "delivery-head",
+      pushedRevision: "delivery-head",
+      pullRequestNumber: 42,
+      pullRequestUrl: "https://github.com/example/repo/pull/42",
+      lastError: null,
+      updatedAt: now,
+    });
+    const { container } = render(<GoalIntegrationView goalId="dashboard" integrations={[integration]} delivery={delivery} loading={false} />);
+    expect(screen.getByText("codex/goal-dashboard")).toBeTruthy();
+    expect(screen.getByText("PR #42")).toBeTruthy();
     fireEvent.click(container.querySelector("summary")!);
     expect(screen.getByText("Validation gate failed")).toBeTruthy();
     expect(screen.getByText("src/api.ts")).toBeTruthy();

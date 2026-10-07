@@ -247,6 +247,8 @@ impl Default for CoordinationApiManifest {
                 "work-packages".into(),
                 "claims".into(),
                 "claim-traces".into(),
+                "partial-work-artifacts".into(),
+                "goal-delivery".into(),
                 "contracts".into(),
                 "events".into(),
                 "event-streams".into(),
