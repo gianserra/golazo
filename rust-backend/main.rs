@@ -116,6 +116,10 @@ async fn main() {
         profile_path: app_data.join("profile.json"),
     };
     coordination::alerts::spawn_operational_alert_monitor(Arc::clone(&state.tracker_root));
+    coordination::supervisor_runtime::spawn_supervisor_runtime_monitor(
+        Arc::clone(&state.tracker_root),
+        Arc::clone(&state.runner),
+    );
     let port = env::var("GOLAZO_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())

@@ -2100,6 +2100,10 @@ pub struct SupervisorBudgetLedger {
     pub attempts_by_trigger: BTreeMap<String, u32>,
     #[serde(default)]
     pub completed_trigger_keys: Vec<String>,
+    #[serde(default)]
+    pub last_failure: Option<String>,
+    #[serde(default)]
+    pub last_failure_at: Option<DateTime<Utc>>,
 }
 
 impl SupervisorBudgetLedger {
@@ -2114,6 +2118,8 @@ impl SupervisorBudgetLedger {
             circuit_open_until: None,
             attempts_by_trigger: BTreeMap::new(),
             completed_trigger_keys: Vec::new(),
+            last_failure: None,
+            last_failure_at: None,
         }
     }
 

@@ -28,6 +28,16 @@ const steps = [
     ],
   },
   {
+    name: "live Supervisor Codex evaluation, targeted delivery, and restart-safe replay",
+    command: process.execPath,
+    args: [
+      "scripts/run-cargo.mjs",
+      "test",
+      "--quiet",
+      "coordination::supervisor_runtime::tests",
+    ],
+  },
+  {
     name: "backup, restart, queue recovery, and dirty-worktree preservation",
     command: process.execPath,
     args: ["scripts/run-cargo.mjs", "test", "--quiet", "coordination::disaster_recovery"],

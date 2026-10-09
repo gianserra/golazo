@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AssistantMessageContent,
+  AutonomousDetailsDisclosure,
   AutonomousExecutionDisclosure,
   GoalClaimPackageDetails,
   GoalEscalationInbox,
@@ -13,13 +14,16 @@ import {
   GoalWorkerDock,
   GoalWorkers,
   api,
+  latestWorkerRunActivity,
   loadGoalPoolSummary,
   parseWorkerCompletionResult,
   parseWorkerStructuredUpdate,
   preservedChatScrollTop,
   ScrollToLatestButton,
+  SupervisorRuntimeCard,
   sameThreadTurns,
   unreadResponseDelta,
+  workerNeedsCurrentAttention,
   WorkingUpdateContent,
 } from "./App";
 import type {
@@ -55,6 +59,7 @@ function summary(overrides: Partial<GoalPoolSummary> = {}): GoalPoolSummary {
     mode: "running",
     health: "healthy",
     healthLabel: "Healthy",
+    supervisor: null,
     readyUnits: [],
     workers: [],
     claims: [],
@@ -117,7 +122,7 @@ describe("worker completion presentation", () => {
     });
 
     expect(parseWorkerStructuredUpdate(payload)?.completedStepIds).toEqual([]);
-    expect(parseWorkerCompletionResult(payload)).toBeNull();
+    expect(parseWorkerCompletionResult(payload)?.completedStepIds).toEqual([]);
     render(<WorkingUpdateContent text={payload} />);
     expect(screen.getByText("Worker progress")).toBeTruthy();
     expect(screen.getByText("Source-path IDs are implemented and focused validation is starting.")).toBeTruthy();
@@ -126,10 +131,82 @@ describe("worker completion presentation", () => {
     expect(screen.getByText("Raw structured update")).toBeTruthy();
   });
 
+  it("renders a final partial result without pretending a tracker step completed", () => {
+    const payload = JSON.stringify({
+      completedStepIds: [],
+      evidenceRefs: ["src/Rules/ConsistencyRule.cs"],
+      knownRisks: ["One acceptance case remains."],
+      summary: "Integrated a verified portion of the consistency rules.",
+      validationCommands: ["dotnet build"],
+    });
+
+    render(<AssistantMessageContent text={payload} />);
+    expect(screen.getByText("Worker progress recorded")).toBeTruthy();
+    expect(screen.getByText(/No tracker step was marked complete/)).toBeTruthy();
+    expect(screen.queryByText("Worker completed")).toBeNull();
+  });
+
   it("hides incomplete streaming JSON until the structured update is readable", () => {
     render(<WorkingUpdateContent text={'{"completedStepIds":[],"summary":"Still validating"'} />);
     expect(screen.getByText("Receiving structured worker update…")).toBeTruthy();
     expect(screen.queryByText(/completedStepIds/)).toBeNull();
+  });
+
+  it("uses the latest Codex commentary as live worker activity", () => {
+    const run = {
+      id: "run-live",
+      status: "running",
+      created_at: "2026-10-05T14:00:00.000Z",
+      started_at: "2026-10-05T14:00:01.000Z",
+      finished_at: null,
+      final_message: null,
+      events: [
+        {
+          method: "item/completed",
+          params: {
+            completedAtMs: 1_759_674_010_000,
+            item: { id: "message-1", type: "agentMessage", phase: "commentary", text: "Inspecting the parser." },
+          },
+        },
+        {
+          method: "item/started",
+          params: {
+            startedAtMs: 1_759_674_020_000,
+            item: { id: "message-2", type: "agentMessage", phase: "commentary", text: "" },
+          },
+        },
+        { method: "item/agentMessage/delta", params: { itemId: "message-2", delta: "Focused tests " } },
+        { method: "item/agentMessage/delta", params: { itemId: "message-2", delta: "are running now." } },
+      ],
+    };
+
+    expect(latestWorkerRunActivity(run as never)).toEqual({
+      summary: "Focused tests are running now.",
+      at: "2025-10-05T14:20:20.000Z",
+    });
+  });
+
+  it("uses a completed worker's structured final summary instead of a lifecycle label", () => {
+    const run = {
+      id: "run-complete",
+      status: "completed",
+      created_at: "2026-10-05T14:00:00.000Z",
+      started_at: "2026-10-05T14:00:01.000Z",
+      finished_at: "2026-10-05T14:05:00.000Z",
+      final_message: JSON.stringify({
+        completedStepIds: ["parser-coverage"],
+        evidenceRefs: ["tests/parser.test.ts"],
+        knownRisks: [],
+        summary: "Parser coverage is implemented and verified.",
+        validationCommands: ["pnpm test"],
+      }),
+      events: [],
+    };
+
+    expect(latestWorkerRunActivity(run as never)).toEqual({
+      summary: "Parser coverage is implemented and verified.",
+      at: "2026-10-05T14:05:00.000Z",
+    });
   });
 
   it("keeps unchanged polling data stable and preserves a detached reader position", () => {
@@ -161,6 +238,12 @@ describe("conversation scrolling", () => {
 });
 
 describe("worker dashboard", () => {
+  it("does not keep the current pool unhealthy for historical replaced workers", () => {
+    expect(workerNeedsCurrentAttention({ state: "failed", activeClaims: [] })).toBe(false);
+    expect(workerNeedsCurrentAttention({ state: "failed", activeClaims: ["claim-still-owned"] })).toBe(true);
+    expect(workerNeedsCurrentAttention({ state: "recovering", activeClaims: ["claim-recovering"] })).toBe(true);
+  });
+
   it("prioritizes a live worker dock with expandable details and thread access", async () => {
     const onOpenThread = vi.fn();
     const worker: GoalWorkerCardData = {
@@ -257,6 +340,36 @@ describe("worker dashboard", () => {
     expect(screen.queryByRole("region", { name: "Live worker pool" })).toBeNull();
   });
 
+  it("does not label a terminal failed pool as live", () => {
+    const worker: GoalWorkerCardData = {
+      id: "worker-failed-001",
+      createdAt: now,
+      updatedAt: now,
+      state: "failed",
+      claimId: null,
+      claimLabel: "Document understanding",
+      packageLabel: null,
+      runId: "run-failed-001",
+      threadId: "thread-failed-001",
+      branch: "golazo/worker-failed-001",
+      workspacePath: "/tmp/worktrees/worker-failed-001",
+      activity: "Codex worker failed (usageLimitExceeded): Usage limit reached",
+      activityAt: now,
+      validation: "unknown",
+      lastHeartbeatAt: now,
+      terminationReason: "Usage limit reached",
+      failureCode: "usageLimitExceeded",
+      failureMessage: "Usage limit reached",
+      recoveryGuidance: "Retry after the account limit resets.",
+    };
+
+    render(<GoalWorkerDock summary={summary({ activeWorkers: 0, workers: [worker] })} loading={false} error={null} />);
+
+    expect(screen.getByRole("region", { name: "Worker pool needs attention" })).toBeTruthy();
+    expect(screen.getByText("No worker process is currently running. Review the worker failures before retrying ready work.")).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Live worker pool" })).toBeNull();
+  });
+
   it("keeps autonomous controls collapsed behind a compact status summary", async () => {
     const onToggle = vi.fn();
     const view = render(
@@ -277,6 +390,32 @@ describe("worker dashboard", () => {
     expect(screen.getByText("2 need attention")).toBeTruthy();
     fireEvent.click(view.container.querySelector("summary")!);
     await waitFor(() => expect(onToggle).toHaveBeenCalledWith(true));
+  });
+
+  it("keeps claims, integrations, and coordination history behind one audit disclosure", () => {
+    const view = render(
+      <AutonomousDetailsDisclosure claims={4} integrations={11} events={96} attentionCount={0}>
+        <p>Detailed audit records</p>
+      </AutonomousDetailsDisclosure>,
+    );
+
+    const disclosure = view.container.querySelector("details.autonomous-details") as HTMLDetailsElement;
+    expect(disclosure.open).toBe(false);
+    expect(screen.getByText("Details & history")).toBeTruthy();
+    expect(screen.getByText("4 claims · 11 integrations · 96 events")).toBeTruthy();
+  });
+
+  it("surfaces hidden history that needs attention without expanding it", () => {
+    const view = render(
+      <AutonomousDetailsDisclosure claims={0} integrations={3} events={12} attentionCount={2}>
+        <p>Detailed audit records</p>
+      </AutonomousDetailsDisclosure>,
+    );
+
+    const disclosure = view.container.querySelector("details.autonomous-details") as HTMLDetailsElement;
+    expect(disclosure.open).toBe(false);
+    expect(disclosure.classList.contains("has-attention")).toBe(true);
+    expect(screen.getByText("2 need attention")).toBeTruthy();
   });
 
   it("shows normal and stalled worker state with operational context", () => {
@@ -360,6 +499,50 @@ describe("worker dashboard", () => {
     expect(screen.getByText("Usage Limit Exceeded")).toBeTruthy();
     expect(screen.getByText("You have reached your Codex usage limit.")).toBeTruthy();
     expect(screen.getByText(/uncommitted changes are preserved/)).toBeTruthy();
+  });
+
+  it("collapses a superseded terminal worker into audit history", () => {
+    const older: GoalWorkerCardData = {
+      id: "worker-old",
+      createdAt: "2026-10-05T10:00:00.000Z",
+      updatedAt: "2026-10-05T10:30:00.000Z",
+      state: "failed",
+      claimId: "claim-old",
+      claimLabel: "Document understanding",
+      packageLabel: null,
+      runId: "run-old",
+      threadId: "thread-old",
+      branch: "golazo/worker-old",
+      workspacePath: "/tmp/worktrees/worker-old",
+      activity: "Startup recovery found no active claim or run",
+      activityAt: "2026-10-05T10:30:00.000Z",
+      validation: "unknown",
+      lastHeartbeatAt: "2026-10-05T10:20:00.000Z",
+      terminationReason: "startup recovery found no active claim or Codex run to recover",
+      failureCode: null,
+      failureMessage: null,
+      recoveryGuidance: null,
+    };
+    const newer: GoalWorkerCardData = {
+      ...older,
+      id: "worker-new",
+      createdAt: "2026-10-05T11:00:00.000Z",
+      updatedAt: "2026-10-05T11:05:00.000Z",
+      state: "active",
+      claimId: "claim-new",
+      runId: "run-new",
+      threadId: "thread-new",
+      activity: "Parsing the next document fixture",
+      terminationReason: null,
+    };
+
+    const { container } = render(<GoalWorkers workers={[newer, older]} loading={false} error={null} />);
+    const history = container.querySelector("details.worker-history") as HTMLDetailsElement;
+    expect(history).toBeTruthy();
+    expect(history.open).toBe(false);
+    expect(screen.getByText("1 superseded")).toBeTruthy();
+    expect(container.querySelectorAll(".worker-list > .worker-card")).toHaveLength(1);
+    expect(history.querySelectorAll(":scope > div > .worker-card")).toHaveLength(1);
   });
 
   it("renders managed overlap evidence inside a claimed feature", () => {
@@ -609,6 +792,27 @@ describe("worker dashboard", () => {
       const url = String(input);
       const body = url.includes("/health")
         ? resource("dashboard", { status: "healthy", operatingMode: "normal", components: [] })
+        : url.includes("/supervisor")
+        ? resource("dashboard", {
+            goalId: "dashboard",
+            state: "idle",
+            poolMode: "running",
+            activeRunId: null,
+            activeThreadId: null,
+            currentTriggerKey: null,
+            acknowledgedEventSequence: 12,
+            lastDeliveredEventSequence: 12,
+            evaluationCount: 2,
+            consumedTokens: 1450,
+            circuitOpenUntil: null,
+            pendingTriggerCount: 0,
+            lastInterventionId: "intervention-1",
+            lastInterventionLevel: "recommend",
+            lastInterventionState: "applied",
+            lastInterventionSummary: "Keep both workers on their current claims.",
+            lastInterventionAt: now,
+            lastFailure: null,
+          })
         : url.includes("/pool")
         ? pool
         : { apiVersion: "v1", items: [...collections.entries()].find(([suffix]) => url.includes(suffix))?.[1] || [], nextCursor: null };
@@ -618,6 +822,7 @@ describe("worker dashboard", () => {
     const loaded = await loadGoalPoolSummary("dashboard");
     expect(loaded.poolResourceVersion).toBe("11");
     expect(loaded.healthLabel).toBe("Healthy");
+    expect(loaded.supervisor?.data).toMatchObject({ state: "idle", evaluationCount: 2, consumedTokens: 1450 });
     expect(loaded.workers).toHaveLength(1);
     expect(loaded.workers[0]).toMatchObject({
       id: "worker-api-001",
@@ -628,7 +833,56 @@ describe("worker dashboard", () => {
     });
   });
 
-  it("sends explicit user and goal permission policy when configuring workers", async () => {
+  it("shows live Supervisor state without exposing the full control surface", () => {
+    const supervisor = resource("dashboard", {
+      goalId: "dashboard",
+      state: "evaluating" as const,
+      poolMode: "running",
+      activeRunId: "run-supervisor-1",
+      activeThreadId: "thread-supervisor-1",
+      currentTriggerKey: "worker_stalled:worker-1",
+      acknowledgedEventSequence: 18,
+      lastDeliveredEventSequence: 20,
+      evaluationCount: 3,
+      consumedTokens: 2200,
+      circuitOpenUntil: null,
+      pendingTriggerCount: 2,
+      lastInterventionId: "intervention-1",
+      lastInterventionLevel: "coordinate",
+      lastInterventionState: "applied",
+      lastInterventionSummary: "Reassign the abandoned claim after preserving its workspace.",
+      lastInterventionAt: now,
+      lastFailure: null,
+    });
+    render(<SupervisorRuntimeCard resource={supervisor} loading={false} />);
+    expect(screen.getByText("Supervisor")).toBeTruthy();
+    expect(screen.getByText("Evaluating")).toBeTruthy();
+    expect(screen.getByText("worker_stalled:worker-1")).toBeTruthy();
+    expect(screen.getByText("Reassign the abandoned claim after preserving its workspace.")).toBeTruthy();
+    expect(screen.getByText("2,200")).toBeTruthy();
+  });
+
+  it("presents only the normal worker count and valid primary action by default", () => {
+    const { container } = render(
+      <GoalPoolControls
+        goalId="dashboard"
+        summary={summary({ mode: "stopped", activeWorkers: 0 })}
+        loading={false}
+        actor="Alex"
+        permissionMode="ask"
+        onChanged={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "Run workers" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Start workers" })).toBeTruthy();
+    expect(container.querySelectorAll(".worker-primary-actions button")).toHaveLength(1);
+    expect((container.querySelector(".worker-settings-disclosure") as HTMLDetailsElement).open).toBe(false);
+    expect((container.querySelector(".advanced-worker-controls") as HTMLDetailsElement).open).toBe(false);
+    expect(screen.getByText("Workspace-only changes · local commands and Git · no network · approval when needed")).toBeTruthy();
+  });
+
+  it("sends explicit user and goal permission policy when starting workers", async () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
     const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => ({
       ok: true,
@@ -647,7 +901,7 @@ describe("worker dashboard", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Configure" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start workers" }));
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
     const request = fetchMock.mock.calls[0][1]!;
     const payload = JSON.parse(String(request.body));
@@ -672,7 +926,7 @@ describe("worker dashboard", () => {
       maxGoalConcurrency: 4,
     });
     expect(payload.confirmation).toMatchObject({
-      action: "pool.configure_policy",
+      action: "pool.start_policy",
       target: "dashboard",
       confirmedBy: "Alex",
     });

@@ -626,12 +626,16 @@ impl IntegrationFinalizationService {
                 "a passing validation report for the queued artifact is required".into(),
             ));
         }
-        if request.tracker_step_ids.is_empty()
-            || request.tracker_summary.trim().is_empty()
+        if request.tracker_summary.trim().is_empty()
             || request.integration_revision.trim().is_empty()
         {
             return Err(IntegrationArtifactError::InvalidReconciliation(
-                "tracker steps, summary, and integration revision are required".into(),
+                "tracker summary and integration revision are required".into(),
+            ));
+        }
+        if request.tracker_status == Status::Done && request.tracker_step_ids.is_empty() {
+            return Err(IntegrationArtifactError::InvalidReconciliation(
+                "a completed tracker step is required when finalizing as Done".into(),
             ));
         }
         let status = match request.tracker_status {
@@ -2096,6 +2100,94 @@ mod tests {
                     .starts_with("integration-finalization:"))
         );
         assert!(finalizer.recover_prepared(now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn finalizes_verified_partial_progress_without_completing_a_tracker_step() {
+        let directory = TempDir::new().unwrap();
+        let tracker = Tracker::new(directory.path().join("trackers"));
+        tracker
+            .create_goal_with_features(
+                "goal-a",
+                "Goal A",
+                "partial integration finalization",
+                vec![crate::models::Feature {
+                    id: "delivery".into(),
+                    title: "Delivery".into(),
+                    description: String::new(),
+                    status: Status::Partial,
+                    steps: vec![crate::models::Step {
+                        id: "integrate".into(),
+                        title: "Integrate".into(),
+                        done: false,
+                        next: true,
+                    }],
+                }],
+            )
+            .unwrap();
+        let store = Arc::new(
+            SqliteCoordinationStore::open(directory.path().join("coordination.sqlite")).unwrap(),
+        );
+        let now = Utc::now();
+        let mut worker = Worker::new("goal-a", now);
+        worker.transition(WorkerState::Starting, now, None).unwrap();
+        worker.transition(WorkerState::Active, now, None).unwrap();
+        let claim = Claim::new(
+            "goal-a",
+            ClaimScope::Feature {
+                feature_id: "delivery".into(),
+            },
+            worker.id.clone(),
+            "base",
+            now,
+            now + Duration::minutes(5),
+        )
+        .unwrap();
+        worker.active_claims.push(claim.id.clone());
+        store.upsert_worker(&worker).unwrap();
+        store.insert_claim(&claim).unwrap();
+        let mut artifact = queued_artifact("repo-a", now);
+        artifact.goal_id = "goal-a".into();
+        artifact.claim_id = claim.id.clone();
+        artifact.claim_generation = claim.lease_generation;
+        artifact.worker_id = worker.id.clone();
+        store.insert_integration_artifact(&artifact).unwrap();
+        let report = IntegrationValidationReport {
+            metadata: RecordMetadata::new(now),
+            id: ValidationReportId::new(),
+            artifact_id: artifact.id.clone(),
+            goal_id: "goal-a".into(),
+            worker_id: worker.id.clone(),
+            passed: true,
+            results: Vec::new(),
+        };
+        store.insert_validation_report(&report).unwrap();
+        let queue = IntegrationQueueService::new(store.clone());
+        queue.enqueue(&artifact.id, 0, now).unwrap();
+        let running = queue.acquire_next("repo-a", now).unwrap().unwrap();
+
+        let completed = IntegrationFinalizationService::new(store.clone(), tracker.clone())
+            .finalize(
+                IntegrationFinalizationRequest {
+                    job_id: running.id,
+                    validation_report_id: report.id,
+                    tracker_feature_id: "delivery".into(),
+                    tracker_step_ids: vec![],
+                    tracker_summary: "Integrated a verified portion of delivery".into(),
+                    tracker_evidence: vec!["validation:passed".into()],
+                    tracker_status: Status::Partial,
+                    integration_revision: artifact.head_revision,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(completed.state, IntegrationFinalizationState::Completed);
+        let goal = tracker.get_goal("goal-a").unwrap();
+        assert_eq!(goal["features"][0]["steps"][0]["done"], false);
+        assert_eq!(goal["features"][0]["steps"][0]["next"], true);
+        assert_eq!(goal["features"][0]["status"], "Partial");
+        assert_eq!(goal["slices"].as_array().unwrap().len(), 1);
     }
 
     #[test]

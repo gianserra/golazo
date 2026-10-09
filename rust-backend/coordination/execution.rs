@@ -907,17 +907,6 @@ fn drain_integration_queue(
             .iter()
             .filter_map(|reference| reference.strip_prefix("tracker-step:").map(str::to_string))
             .collect::<Vec<_>>();
-        if step_ids.is_empty() {
-            queue
-                .finish(
-                    &job.id,
-                    false,
-                    "worker did not identify a completed tracker step",
-                    now,
-                )
-                .map_err(|error| error.to_string())?;
-            return Err("worker did not identify a completed tracker step".into());
-        }
         let repository = store
             .worker(&artifact.worker_id)
             .map_err(|error| error.to_string())?
@@ -1074,8 +1063,8 @@ fn parse_worker_completion(message: &str) -> Result<WorkerCompletion, String> {
     };
     let result: WorkerCompletion = serde_json::from_str(candidate)
         .map_err(|error| format!("invalid worker completion result: {error}"))?;
-    if result.summary.trim().is_empty() || result.completed_step_ids.is_empty() {
-        return Err("worker completion requires a summary and at least one tracker step ID".into());
+    if result.summary.trim().is_empty() {
+        return Err("worker completion requires a summary".into());
     }
     Ok(result)
 }
@@ -1137,6 +1126,13 @@ mod tests {
     fn parses_structured_worker_completion() {
         let completion = parse_worker_completion(r#"{"summary":"done","completedStepIds":["step-a"],"validationCommands":["cargo test"],"evidenceRefs":[],"knownRisks":[]}"#).unwrap();
         assert_eq!(completion.completed_step_ids, vec!["step-a"]);
+    }
+
+    #[test]
+    fn parses_partial_worker_completion_without_completed_steps() {
+        let completion = parse_worker_completion(r#"{"summary":"implemented part of the slice","completedStepIds":[],"validationCommands":["cargo test"],"evidenceRefs":["src/lib.rs"],"knownRisks":["remaining acceptance work"]}"#).unwrap();
+        assert!(completion.completed_step_ids.is_empty());
+        assert_eq!(completion.summary, "implemented part of the slice");
     }
 
     #[test]

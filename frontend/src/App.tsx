@@ -177,6 +177,26 @@ type CoordinationIntervention = {
   decisionSummary?: string;
   confidencePercent?: number | null;
 };
+type CoordinationSupervisorRuntime = {
+  goalId: string;
+  state: "stopped" | "paused" | "idle" | "evaluating" | "degraded" | "circuit_open";
+  poolMode?: string | null;
+  activeRunId?: string | null;
+  activeThreadId?: string | null;
+  currentTriggerKey?: string | null;
+  acknowledgedEventSequence: number;
+  lastDeliveredEventSequence: number;
+  evaluationCount: number;
+  consumedTokens: number;
+  circuitOpenUntil?: string | null;
+  pendingTriggerCount: number;
+  lastInterventionId?: string | null;
+  lastInterventionLevel?: string | null;
+  lastInterventionState?: string | null;
+  lastInterventionSummary?: string | null;
+  lastInterventionAt?: string | null;
+  lastFailure?: string | null;
+};
 type CoordinationNotification = {
   state: string;
   purpose: string;
@@ -324,6 +344,7 @@ type GoalPoolSummary = {
   mode: string;
   health: "healthy" | "attention" | "paused" | "inactive";
   healthLabel: string;
+  supervisor: CoordinationResource<CoordinationSupervisorRuntime> | null;
   readyUnits: Array<CoordinationResource<CoordinationReadyScope>>;
   workers: GoalWorkerCardData[];
   claims: Array<CoordinationResource<CoordinationClaim>>;
@@ -398,6 +419,8 @@ type Run = {
   resumed_from: string | null;
   status: "queued" | "running" | "completed" | "failed";
   created_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
   final_message: string | null;
   error: string | null;
   terminal_error?: {
@@ -691,6 +714,71 @@ function coordinationEventSummary(event: CoordinationEvent | undefined): string 
   return event?.kind ? event.kind.replaceAll("_", " ") : "No activity reported";
 }
 
+type WorkerRunActivity = { summary: string; at: string | null };
+
+function workerActivitySummary(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const structured = parseWorkerStructuredUpdate(trimmed);
+  const summary = (structured?.summary || trimmed).replace(/\s+/g, " ").trim();
+  if (!summary) return null;
+  return summary.length > 360 ? `${summary.slice(0, 357).trimEnd()}…` : summary;
+}
+
+function eventTimestamp(params: Record<string, unknown>): string | null {
+  const value = [params.completedAtMs, params.startedAtMs]
+    .find((candidate) => typeof candidate === "number" && Number.isFinite(candidate));
+  return typeof value === "number" ? new Date(value).toISOString() : null;
+}
+
+function latestWorkerRunActivity(run: Run | null): WorkerRunActivity | null {
+  if (!run) return null;
+  const messages = new Map<string, { text: string; at: string | null; order: number }>();
+
+  (run.events || []).forEach((rawEvent, order) => {
+    if (!rawEvent || typeof rawEvent !== "object") return;
+    const event = rawEvent as Record<string, unknown>;
+    const method = typeof event.method === "string" ? event.method : "";
+    const params = event.params && typeof event.params === "object"
+      ? event.params as Record<string, unknown>
+      : {};
+
+    if (method === "item/agentMessage/delta") {
+      const itemId = typeof params.itemId === "string" ? params.itemId : null;
+      const delta = typeof params.delta === "string" ? params.delta : "";
+      if (!itemId || !delta) return;
+      const current = messages.get(itemId) || { text: "", at: null, order };
+      messages.set(itemId, { ...current, text: `${current.text}${delta}`, order });
+      return;
+    }
+
+    if (!["item/started", "item/completed"].includes(method)) return;
+    const item = params.item && typeof params.item === "object"
+      ? params.item as Record<string, unknown>
+      : null;
+    if (!item || item.type !== "agentMessage" || typeof item.id !== "string") return;
+    const current = messages.get(item.id) || { text: "", at: null, order };
+    messages.set(item.id, {
+      text: typeof item.text === "string" && item.text.trim() ? item.text : current.text,
+      at: eventTimestamp(params) || current.at,
+      order,
+    });
+  });
+
+  if (run.status === "completed" && run.final_message) {
+    const summary = workerActivitySummary(run.final_message);
+    if (summary) return { summary, at: run.finished_at || null };
+  }
+
+  const latest = [...messages.values()]
+    .sort((left, right) => right.order - left.order)
+    .find((message) => workerActivitySummary(message.text));
+  const summary = latest ? workerActivitySummary(latest.text) : null;
+  return summary
+    ? { summary, at: latest?.at || run.finished_at || run.started_at || run.created_at }
+    : null;
+}
+
 function compactIdentifier(value: string | null): string {
   if (!value) return "None";
   if (value.length <= 12) return value;
@@ -758,11 +846,17 @@ function workerStateTone(state: string): "healthy" | "attention" | "paused" | "i
   return "inactive";
 }
 
+function workerNeedsCurrentAttention(worker: CoordinationWorker): boolean {
+  return ["blocked", "recovering"].includes(worker.state)
+    || (worker.state === "failed" && worker.activeClaims.length > 0);
+}
+
 async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
   const goal = encodeURIComponent(goalId);
-  const [pool, healthSnapshot, delivery, readyWork, claims, packages, workerResources, artifacts, contracts, events, interventions, notifications, escalationResources] = await Promise.all([
+  const [pool, healthSnapshot, supervisor, delivery, readyWork, claims, packages, workerResources, artifacts, contracts, events, interventions, notifications, escalationResources] = await Promise.all([
     optionalApi<CoordinationResource<CoordinationPool>>(`/coordination/v1/goals/${goal}/pool`),
     optionalApi<CoordinationResource<CoordinationGoalHealth>>(`/coordination/v1/goals/${goal}/health`),
+    optionalApi<CoordinationResource<CoordinationSupervisorRuntime>>(`/coordination/v1/goals/${goal}/supervisor`),
     optionalApi<CoordinationResource<CoordinationGoalDelivery>>(`/coordination/v1/goals/${goal}/delivery`),
     allCoordinationItems<CoordinationReadyScope>(`/coordination/v1/goals/${goal}/ready-work`),
     allCoordinationItems<CoordinationClaim>(`/coordination/v1/goals/${goal}/claims`),
@@ -838,8 +932,15 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
     );
     return [worker.metadata.id, page.items] as const;
   })));
-  const terminalRunByWorker = new Map(await Promise.all(workerResources
-    .filter((worker) => ["failed", "recovering"].includes(worker.data.state))
+  const terminalWorkerStates = new Set(["completed", "failed", "cancelled"]);
+  const engagedWorkers = workerResources.filter((worker) =>
+    !terminalWorkerStates.has(worker.data.state) || workerNeedsCurrentAttention(worker.data));
+  const activityWorkers = engagedWorkers.length
+    ? engagedWorkers
+    : [...workerResources]
+      .sort((left, right) => right.metadata.updatedAt.localeCompare(left.metadata.updatedAt))
+      .slice(0, Math.max(1, pool?.data.goal.desiredConcurrency || 4));
+  const workerRunByWorker = new Map(await Promise.all(activityWorkers
     .map(async (worker) => {
       const latestTurn = worker.data.turnHistory?.at(-1);
       const runId = worker.data.currentRunId || latestTurn?.runId || null;
@@ -875,9 +976,10 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
         : "unknown";
     const featureId = claim?.data.scope.kind === "feature" ? claim.data.scope.feature_id : null;
     const latestTurn = worker.turnHistory?.at(-1);
-    const terminalRun = terminalRunByWorker.get(resource.metadata.id) || null;
-    const failureCode = terminalRun?.terminal_error?.code || null;
-    const failureMessage = terminalRun?.terminal_error?.message || terminalRun?.error || null;
+    const workerRun = workerRunByWorker.get(resource.metadata.id) || null;
+    const runActivity = latestWorkerRunActivity(workerRun);
+    const failureCode = workerRun?.terminal_error?.code || null;
+    const failureMessage = workerRun?.terminal_error?.message || workerRun?.error || null;
     const workspacePath = worker.workspace?.worktreePath || null;
     const runtimeInterrupted = worker.state === "recovering" && !worker.currentRunId;
     return {
@@ -894,8 +996,8 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
       workspacePath,
       activity: runtimeInterrupted
         ? "Runtime interrupted; Golazo is preserving the workspace and reassigning this claim"
-        : coordinationEventSummary(latestActivity),
-      activityAt: latestActivity?.occurredAt || null,
+        : runActivity?.summary || coordinationEventSummary(latestActivity),
+      activityAt: runActivity?.at || latestActivity?.occurredAt || null,
       validation,
       lastHeartbeatAt: worker.lastHeartbeatAt || claim?.data.heartbeatAt || null,
       terminationReason: worker.termination?.reason || null,
@@ -916,6 +1018,19 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
     return "neutral";
   };
   const activity: GoalActivityItem[] = [
+    ...(supervisor && (supervisor.data.state === "evaluating" || supervisor.data.state === "degraded" || supervisor.data.state === "circuit_open" || supervisor.data.pendingTriggerCount > 0)
+      ? [{
+          id: `runtime-${supervisor.metadata.resourceVersion}`,
+          category: "supervisor" as const,
+          at: supervisor.metadata.updatedAt,
+          title: supervisor.data.state === "evaluating" ? "Supervisor evaluating" : "Supervisor runtime",
+          summary: supervisor.data.currentTriggerKey
+            || supervisor.data.lastFailure
+            || `${supervisor.data.pendingTriggerCount} trigger${supervisor.data.pendingTriggerCount === 1 ? "" : "s"} waiting for evaluation`,
+          state: supervisor.data.state,
+          tone: (supervisor.data.state === "degraded" || supervisor.data.state === "circuit_open" ? "critical" : "attention") as GoalActivityItem["tone"],
+        }]
+      : []),
     ...events.map((event): GoalActivityItem => ({
       id: event.metadata.id,
       category: "events",
@@ -1056,6 +1171,7 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
       mode: "not configured",
       health: "inactive",
       healthLabel: "Not started",
+      supervisor,
       readyUnits: readyWork,
       workers,
       claims,
@@ -1071,9 +1187,7 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
   const authoritativeAttention = healthSnapshot
     ? ["degraded", "unhealthy"].includes(healthSnapshot.data.status)
     : false;
-  const hasUnhealthyWorker = pool.data.workers.some((worker) =>
-    ["blocked", "failed", "recovering"].includes(worker.state),
-  );
+  const hasUnhealthyWorker = pool.data.workers.some(workerNeedsCurrentAttention);
   const belowDesiredWithWork = pool.data.goal.mode === "running"
     && pool.data.activeWorkers < pool.data.goal.desiredConcurrency
     && readyWork.length > 0;
@@ -1108,6 +1222,7 @@ async function loadGoalPoolSummary(goalId: string): Promise<GoalPoolSummary> {
     mode: pool.data.goal.mode,
     health,
     healthLabel,
+    supervisor,
     readyUnits: readyWork,
     workers,
     claims,
@@ -1161,8 +1276,7 @@ function parseWorkerStructuredUpdate(text: string): WorkerCompletionResult | nul
 }
 
 function parseWorkerCompletionResult(text: string): WorkerCompletionResult | null {
-  const result = parseWorkerStructuredUpdate(text);
-  return result && result.completedStepIds.length > 0 ? result : null;
+  return parseWorkerStructuredUpdate(text);
 }
 
 function readableIdentifier(value: string): string {
@@ -1219,21 +1333,23 @@ function ScrollToLatestButton({ unreadCount, onClick }: { unreadCount: number; o
 }
 
 function WorkerCompletionCard({ result, raw }: { result: WorkerCompletionResult; raw: string }) {
+  const partial = result.completedStepIds.length === 0;
   return (
-    <div className="worker-completion-card">
+    <div className={`worker-completion-card${partial ? " worker-progress-card" : ""}`}>
       <header>
-        <span className="worker-completion-icon" aria-hidden="true">✓</span>
-        <div><small>Worker completed</small><strong>{result.summary}</strong></div>
+        <span className={partial ? "worker-progress-icon" : "worker-completion-icon"} aria-hidden="true">{partial ? <i /> : "✓"}</span>
+        <div><small>{partial ? "Worker progress recorded" : "Worker completed"}</small><strong>{result.summary}</strong></div>
       </header>
-      <section>
+      {!partial && <section>
         <h3>Completed work</h3>
         <ul className="worker-completion-steps">
           {result.completedStepIds.map((step) => <li key={step}><i aria-hidden="true">✓</i><span>{readableIdentifier(step)}<code>{step}</code></span></li>)}
         </ul>
-      </section>
+      </section>}
+      {partial && <p className="worker-partial-note">This verified slice was integrated as partial progress. No tracker step was marked complete.</p>}
       {result.knownRisks.length > 0 && (
         <section className="worker-completion-risks">
-          <div><h3>Verification gaps</h3><small>The implementation completed, but these checks need follow-up before merge.</small></div>
+          <div><h3>{partial ? "Remaining work" : "Verification gaps"}</h3><small>{partial ? "These items remain before a tracker step can be completed." : "The implementation completed, but these checks need follow-up before merge."}</small></div>
           {result.knownRisks.map((risk) => <p key={risk}><i aria-hidden="true">!</i><span><strong>{workerRiskLabel(risk)}</strong>{risk}</span></p>)}
         </section>
       )}
@@ -1569,6 +1685,93 @@ function AutonomousExecutionDisclosure({
   );
 }
 
+function AutonomousDetailsDisclosure({
+  claims,
+  integrations,
+  events,
+  attentionCount,
+  children,
+}: {
+  claims: number;
+  integrations: number;
+  events: number;
+  attentionCount: number;
+  children: ReactNode;
+}) {
+  return (
+    <details className={`autonomous-details ${attentionCount ? "has-attention" : ""}`}>
+      <summary>
+        <span><strong>Details &amp; history</strong><small>Claims, integrations, and the coordination audit log</small></span>
+        <em className={attentionCount ? "attention" : ""}>{attentionCount ? `${attentionCount} need attention` : `${claims} claims · ${integrations} integrations · ${events} events`}</em>
+        <i aria-hidden="true" />
+      </summary>
+      <div className="autonomous-details-body">{children}</div>
+    </details>
+  );
+}
+
+function SupervisorRuntimeCard({
+  resource,
+  loading,
+}: {
+  resource: CoordinationResource<CoordinationSupervisorRuntime> | null;
+  loading: boolean;
+}) {
+  const runtime = resource?.data;
+  const tone = runtime?.state === "evaluating" || runtime?.state === "idle"
+    ? "healthy"
+    : runtime?.state === "degraded" || runtime?.state === "circuit_open"
+      ? "attention"
+      : runtime?.state === "paused"
+        ? "paused"
+        : "inactive";
+  const headline = loading && !runtime
+    ? "Loading"
+    : runtime
+      ? humanizeCoordinationState(runtime.state)
+      : "Unavailable";
+  const eventProgress = runtime
+    ? `${runtime.acknowledgedEventSequence} / ${runtime.lastDeliveredEventSequence}`
+    : "—";
+
+  return (
+    <section className={`supervisor-runtime-card ${tone}`} aria-labelledby="supervisor-runtime-heading" aria-busy={loading}>
+      <header>
+        <span className={`pool-health ${tone}`} aria-hidden="true" />
+        <div>
+          <h2 id="supervisor-runtime-heading">Supervisor</h2>
+          <p>Evaluates exceptions and coordinates safe interventions</p>
+        </div>
+        <strong>{headline}</strong>
+      </header>
+      {runtime ? (
+        <>
+          <div className="supervisor-runtime-grid">
+            <div><span>Pending</span><strong className={runtime.pendingTriggerCount ? "attention" : ""}>{runtime.pendingTriggerCount}</strong></div>
+            <div><span>Evaluations</span><strong>{runtime.evaluationCount}</strong></div>
+            <div><span>Tokens</span><strong>{number(runtime.consumedTokens)}</strong></div>
+            <div><span>Event cursor</span><strong>{eventProgress}</strong></div>
+          </div>
+          {runtime.currentTriggerKey && (
+            <p className="supervisor-runtime-focus"><span>Evaluating now</span><strong>{runtime.currentTriggerKey}</strong></p>
+          )}
+          {runtime.lastInterventionSummary && (
+            <p className="supervisor-runtime-outcome">
+              <span>Latest {runtime.lastInterventionLevel ? humanizeCoordinationState(runtime.lastInterventionLevel) : "decision"}</span>
+              <strong>{runtime.lastInterventionSummary}</strong>
+              {runtime.lastInterventionAt && <time dateTime={runtime.lastInterventionAt}>{relativeTimestamp(runtime.lastInterventionAt)}</time>}
+            </p>
+          )}
+          {runtime.lastFailure && <p className="supervisor-runtime-error" role="alert">{runtime.lastFailure}</p>}
+          {runtime.circuitOpenUntil && <p className="supervisor-runtime-circuit">Circuit reopens {relativeTimestamp(runtime.circuitOpenUntil)}</p>}
+        </>
+      ) : (
+        <p className="supervisor-runtime-empty">Supervisor status will appear after the backend is updated and the goal is loaded.</p>
+      )}
+    </section>
+  );
+}
+
 function readyScopeLabel(scope: CoordinationReadyScope): string {
   return scope.kind === "work_package"
     ? `Package · ${scope.work_package_id || "Unknown"}`
@@ -1822,62 +2025,81 @@ function GoalPoolControls({
   return (
     <section className="detail-section pool-controls" aria-labelledby="pool-controls-heading" aria-busy={Boolean(pending) || loading}>
       <div className="section-heading">
-        <h2 id="pool-controls-heading">Pool controls</h2>
+        <h2 id="pool-controls-heading">Run workers</h2>
         <span>{humanizeCoordinationState(mode)}</span>
       </div>
 
-      <div className="control-block">
-        <div className="control-block-heading"><strong>Capacity &amp; lifecycle</strong><small>Maximum 4 workers per goal</small></div>
-        <p className="pool-permission-note">
-          Workers use {permissionMode === "auto-review" ? "automatic review" : "user approval"}, workspace-only writes, local commands and Git, with network access disabled. Each worker is limited to 250,000 tokens and 30 minutes per turn; the goal is limited to 1,000,000 tokens, 8 hours, and 4 concurrent workers.
-        </p>
-        <div className="capacity-control">
-          <label>Desired workers<input type="number" min="1" max="4" value={desiredConcurrency} onChange={(event) => setDesiredConcurrency(Math.max(1, Math.min(4, Number(event.target.value) || 1)))} /></label>
-          <label>Goal base revision<input value={baseRevision} onChange={(event) => setBaseRevision(event.target.value)} maxLength={500} /></label>
-          <button type="button" onClick={() => poolCommand("configure")} disabled={Boolean(pending)}>Configure</button>
+      <div className="control-block worker-primary-control">
+        <div className="control-block-heading"><strong>Worker pool</strong><small>Up to 4 concurrent workers</small></div>
+        <div className="worker-count-row">
+          <label htmlFor="desired-worker-count"><span>Workers</span><small>How many tasks can run at once</small></label>
+          <div className="worker-count-stepper">
+            <button type="button" aria-label="Use one fewer worker" onClick={() => setDesiredConcurrency((value) => Math.max(1, value - 1))} disabled={Boolean(pending) || desiredConcurrency <= 1}>−</button>
+            <input id="desired-worker-count" type="number" min="1" max="4" value={desiredConcurrency} onChange={(event) => setDesiredConcurrency(Math.max(1, Math.min(4, Number(event.target.value) || 1)))} />
+            <button type="button" aria-label="Use one more worker" onClick={() => setDesiredConcurrency((value) => Math.min(4, value + 1))} disabled={Boolean(pending) || desiredConcurrency >= 4}>+</button>
+          </div>
         </div>
-        <div className="control-actions" role="group" aria-label="Worker pool lifecycle">
-          <button type="button" onClick={() => poolCommand("start")} disabled={Boolean(pending) || mode === "running"}>Start</button>
-          <button type="button" onClick={() => poolCommand("pause")} disabled={Boolean(pending) || mode !== "running"}>Pause</button>
-          <button type="button" onClick={() => poolCommand("resume")} disabled={Boolean(pending) || mode !== "paused"}>Resume</button>
-          <button type="button" onClick={() => poolCommand("drain")} disabled={Boolean(pending) || !["running", "paused"].includes(mode)}>Drain</button>
-          <button type="button" onClick={() => poolCommand("reconcile")} disabled={Boolean(pending) || mode !== "running" || !summary?.readyUnits.length}>Fill ready work</button>
-          <button type="button" className="danger" onClick={() => poolCommand("stop")} disabled={Boolean(pending) || !configured || mode === "stopped"}>Stop</button>
+        <div className="worker-primary-actions" role="group" aria-label="Worker pool actions">
+          {!["running", "paused", "draining"].includes(mode) && <button type="button" className="primary" onClick={() => poolCommand("start")} disabled={Boolean(pending)}>Start workers</button>}
+          {mode === "paused" && <button type="button" className="primary" onClick={() => poolCommand("resume")} disabled={Boolean(pending)}>Resume workers</button>}
+          {mode === "running" && <button type="button" onClick={() => poolCommand("pause")} disabled={Boolean(pending)}>Pause</button>}
+          {configured && !["stopped", "not configured"].includes(mode) && <button type="button" className="danger" onClick={() => poolCommand("stop")} disabled={Boolean(pending)}>Stop</button>}
+          {configured && desiredConcurrency !== summary?.desiredConcurrency && <button type="button" onClick={() => poolCommand("configure")} disabled={Boolean(pending)}>Update worker count</button>}
         </div>
+        <p className="worker-policy-summary">Workspace-only changes · local commands and Git · no network · {permissionMode === "auto-review" ? "automatic review" : "approval when needed"}</p>
       </div>
 
-      <details className="control-disclosure">
-        <summary><span>Manual assignment</span><small>{summary?.readyUnits.length || 0} ready</small><i aria-hidden="true" /></summary>
+      <details className="control-disclosure worker-settings-disclosure">
+        <summary><span>Worker settings</span><small>{baseRevision === "goal-current" ? "Current goal revision" : "Custom revision"}</small><i aria-hidden="true" /></summary>
         <div className="control-form">
-          <label>Ready work<select value={readyUnitId} onChange={(event) => setReadyUnitId(event.target.value)}><option value="">Select ready work</option>{summary?.readyUnits.map((unit) => <option value={unit.metadata.id} key={unit.metadata.id}>{readyScopeLabel(unit.data)}</option>)}</select></label>
-          <label>Worker<select value={assignmentWorkerId} onChange={(event) => setAssignmentWorkerId(event.target.value)}><option value="">Select eligible worker</option>{eligibleWorkers.map((worker) => <option value={worker.id} key={worker.id}>{compactIdentifier(worker.id)} · {humanizeCoordinationState(worker.state)}</option>)}</select></label>
-          <button type="button" onClick={assignReadyUnit} disabled={Boolean(pending) || !readyUnitId || !assignmentWorkerId}>Assign selected work</button>
-          {(!summary?.readyUnits.length || !eligibleWorkers.length) && <p>{!summary?.readyUnits.length ? "No unclaimed ready work is available." : "Start or resume the pool to create an eligible worker."}</p>}
-        </div>
-      </details>
-
-      <details className="control-disclosure">
-        <summary><span>Claim ownership</span><small>{activeClaims.length} active</small><i aria-hidden="true" /></summary>
-        <div className="control-form">
-          <label>Active claim<select value={claimId} onChange={(event) => { setClaimId(event.target.value); setReplacementWorkerId(""); }}><option value="">Select active claim</option>{activeClaims.map((claim) => <option value={claim.metadata.id} key={claim.metadata.id}>{compactIdentifier(claim.metadata.id)} · {readyScopeLabel(claim.data.scope)}</option>)}</select></label>
-          <label>Replacement worker<select value={replacementWorkerId} onChange={(event) => setReplacementWorkerId(event.target.value)} disabled={!selectedClaim}><option value="">Select replacement</option>{replacementWorkers.map((worker) => <option value={worker.id} key={worker.id}>{compactIdentifier(worker.id)} · {humanizeCoordinationState(worker.state)}</option>)}</select></label>
-          <label className="control-wide">Reason<textarea value={claimReason} onChange={(event) => setClaimReason(event.target.value)} maxLength={2000} rows={2} placeholder="Explain why ownership is changing or work is being cancelled" /></label>
+          <label className="control-wide">Goal base revision<input value={baseRevision} onChange={(event) => setBaseRevision(event.target.value)} maxLength={500} /></label>
+          <p className="pool-permission-note control-wide">Each worker is limited to 250,000 tokens and 30 minutes per turn. The goal is limited to 1,000,000 tokens, 8 hours, and 4 concurrent workers. Workers cannot use the network.</p>
           <div className="control-actions control-wide">
-            <button type="button" onClick={reassignClaim} disabled={Boolean(pending) || !selectedClaim || !replacementWorkerId || !claimReason.trim()}>Reassign</button>
-            <button type="button" className="danger" onClick={cancelClaim} disabled={Boolean(pending) || !selectedClaim || !claimReason.trim()}>Cancel claim</button>
+            <button type="button" onClick={() => poolCommand("drain")} disabled={Boolean(pending) || !["running", "paused"].includes(mode)}>Finish current work, then stop</button>
+            <button type="button" onClick={() => poolCommand("reconcile")} disabled={Boolean(pending) || mode !== "running" || !summary?.readyUnits.length}>Check for ready work</button>
           </div>
         </div>
       </details>
 
-      <details className="control-disclosure">
-        <summary><span>Decision override</span><small>{unresolvedEscalations.length} open</small><i aria-hidden="true" /></summary>
-        <div className="control-form">
-          <label className="control-wide">Escalation<select value={escalationId} onChange={(event) => { setEscalationId(event.target.value); setOptionId(""); }}><option value="">Select decision or blocker</option>{unresolvedEscalations.map(({ resource }) => <option value={resource.metadata.id} key={resource.metadata.id}>{compactIdentifier(resource.metadata.id)} · {resource.data.summary}</option>)}</select></label>
-          <label>Remediation<select value={optionId} onChange={(event) => setOptionId(event.target.value)} disabled={!selectedEscalation}><option value="">Select option</option>{selectedEscalationOptions.map((option) => <option value={option.id} key={option.id}>{option.label}{option.recommended ? " · recommended" : ""}</option>)}</select></label>
-          <label>Accepted risk<input value={acceptedRisk} onChange={(event) => setAcceptedRisk(event.target.value)} maxLength={2000} placeholder="Required for override" /></label>
-          <label className="control-wide">Decision note<textarea value={overrideReason} onChange={(event) => setOverrideReason(event.target.value)} maxLength={2000} rows={2} placeholder="Why the override is appropriate" /></label>
-          {selectedEscalationStale && <p className="control-wide control-warning">This escalation is stale. Refresh or reconcile its evidence before overriding.</p>}
-          <button type="button" className="control-wide danger" onClick={overrideEscalation} disabled={Boolean(pending) || !selectedEscalation || !optionId || !acceptedRisk.trim() || selectedEscalationStale}>Apply override</button>
+      <details className="control-disclosure advanced-worker-controls">
+        <summary><span>Advanced worker controls</span><small>{activeClaims.length + unresolvedEscalations.length} need oversight</small><i aria-hidden="true" /></summary>
+        <div className="advanced-worker-controls-body">
+          <p>Use these only to manually route work, change ownership, or override a blocked decision.</p>
+
+          <details className="nested-control-disclosure">
+            <summary><span>Assign work manually</span><small>{summary?.readyUnits.length || 0} ready</small><i aria-hidden="true" /></summary>
+            <div className="control-form">
+              <label>Ready work<select value={readyUnitId} onChange={(event) => setReadyUnitId(event.target.value)}><option value="">Select ready work</option>{summary?.readyUnits.map((unit) => <option value={unit.metadata.id} key={unit.metadata.id}>{readyScopeLabel(unit.data)}</option>)}</select></label>
+              <label>Worker<select value={assignmentWorkerId} onChange={(event) => setAssignmentWorkerId(event.target.value)}><option value="">Select eligible worker</option>{eligibleWorkers.map((worker) => <option value={worker.id} key={worker.id}>{compactIdentifier(worker.id)} · {humanizeCoordinationState(worker.state)}</option>)}</select></label>
+              <button type="button" onClick={assignReadyUnit} disabled={Boolean(pending) || !readyUnitId || !assignmentWorkerId}>Assign selected work</button>
+              {(!summary?.readyUnits.length || !eligibleWorkers.length) && <p>{!summary?.readyUnits.length ? "No unclaimed ready work is available." : "Start or resume the pool to create an eligible worker."}</p>}
+            </div>
+          </details>
+
+          <details className="nested-control-disclosure">
+            <summary><span>Change claim ownership</span><small>{activeClaims.length} active</small><i aria-hidden="true" /></summary>
+            <div className="control-form">
+              <label>Active claim<select value={claimId} onChange={(event) => { setClaimId(event.target.value); setReplacementWorkerId(""); }}><option value="">Select active claim</option>{activeClaims.map((claim) => <option value={claim.metadata.id} key={claim.metadata.id}>{compactIdentifier(claim.metadata.id)} · {readyScopeLabel(claim.data.scope)}</option>)}</select></label>
+              <label>Replacement worker<select value={replacementWorkerId} onChange={(event) => setReplacementWorkerId(event.target.value)} disabled={!selectedClaim}><option value="">Select replacement</option>{replacementWorkers.map((worker) => <option value={worker.id} key={worker.id}>{compactIdentifier(worker.id)} · {humanizeCoordinationState(worker.state)}</option>)}</select></label>
+              <label className="control-wide">Reason<textarea value={claimReason} onChange={(event) => setClaimReason(event.target.value)} maxLength={2000} rows={2} placeholder="Explain why ownership is changing or work is being cancelled" /></label>
+              <div className="control-actions control-wide">
+                <button type="button" onClick={reassignClaim} disabled={Boolean(pending) || !selectedClaim || !replacementWorkerId || !claimReason.trim()}>Reassign</button>
+                <button type="button" className="danger" onClick={cancelClaim} disabled={Boolean(pending) || !selectedClaim || !claimReason.trim()}>Cancel claim</button>
+              </div>
+            </div>
+          </details>
+
+          <details className="nested-control-disclosure">
+            <summary><span>Override a decision</span><small>{unresolvedEscalations.length} open</small><i aria-hidden="true" /></summary>
+            <div className="control-form">
+              <label className="control-wide">Escalation<select value={escalationId} onChange={(event) => { setEscalationId(event.target.value); setOptionId(""); }}><option value="">Select decision or blocker</option>{unresolvedEscalations.map(({ resource }) => <option value={resource.metadata.id} key={resource.metadata.id}>{compactIdentifier(resource.metadata.id)} · {resource.data.summary}</option>)}</select></label>
+              <label>Remediation<select value={optionId} onChange={(event) => setOptionId(event.target.value)} disabled={!selectedEscalation}><option value="">Select option</option>{selectedEscalationOptions.map((option) => <option value={option.id} key={option.id}>{option.label}{option.recommended ? " · recommended" : ""}</option>)}</select></label>
+              <label>Accepted risk<input value={acceptedRisk} onChange={(event) => setAcceptedRisk(event.target.value)} maxLength={2000} placeholder="Required for override" /></label>
+              <label className="control-wide">Decision note<textarea value={overrideReason} onChange={(event) => setOverrideReason(event.target.value)} maxLength={2000} rows={2} placeholder="Why the override is appropriate" /></label>
+              {selectedEscalationStale && <p className="control-wide control-warning">This escalation is stale. Refresh or reconcile its evidence before overriding.</p>}
+              <button type="button" className="control-wide danger" onClick={overrideEscalation} disabled={Boolean(pending) || !selectedEscalation || !optionId || !acceptedRisk.trim() || selectedEscalationStale}>Apply override</button>
+            </div>
+          </details>
         </div>
       </details>
 
@@ -1945,6 +2167,12 @@ function GoalWorkerDock({
   const working = workers.filter((worker) => ["starting", "active", "waiting"].includes(worker.state)).length;
   const recovering = workers.filter((worker) => worker.state === "recovering").length;
   const recoveryOnly = recovering > 0 && working === 0;
+  const attentionOnly = failed > 0 && working === 0 && !recoveryOnly;
+  const dockTitle = recoveryOnly
+    ? "Worker recovery required"
+    : attentionOnly
+      ? "Worker pool needs attention"
+      : "Live worker pool";
   const idleSummary = [completed ? `${completed} completed` : "", failed ? `${failed} need attention` : ""].filter(Boolean).join(" · ") || `${workers.length} workers`;
   const latestUpdate = workers.map((worker) => worker.updatedAt || worker.activityAt).filter((value): value is string => Boolean(value)).sort().at(-1) || summary.refreshedAt;
 
@@ -2002,12 +2230,71 @@ function GoalWorkerDock({
   }
 
   return (
-    <section className={`worker-pool-dock priority${recoveryOnly ? " recovery" : ""}`} aria-label={recoveryOnly ? "Worker recovery required" : "Live worker pool"} aria-busy={loading}>
-      <header><span className="worker-dock-live-dot" aria-hidden="true" /><span><strong>{recoveryOnly ? "Worker recovery required" : "Live worker pool"}</strong><small>{workerDockStatus(workers)}</small></span><em>{error ? "Updates interrupted" : `Updated ${relativeTimestamp(summary.refreshedAt)}`}</em></header>
+    <section className={`worker-pool-dock priority${recoveryOnly ? " recovery" : attentionOnly ? " attention" : ""}`} aria-label={dockTitle} aria-busy={loading}>
+      <header><span className="worker-dock-live-dot" aria-hidden="true" /><span><strong>{dockTitle}</strong><small>{workerDockStatus(workers)}</small></span><em>{error ? "Updates interrupted" : `Updated ${relativeTimestamp(summary.refreshedAt)}`}</em></header>
       {recoveryOnly && <p className="worker-dock-recovery" role="status">No worker process is currently running. Golazo is preserving any partial work and assigning replacement workers.</p>}
+      {attentionOnly && <p className="worker-dock-recovery" role="status">No worker process is currently running. Review the worker failures before retrying ready work.</p>}
       {error && <p className="worker-dock-stale" role="alert">Showing the last successful worker snapshot while Golazo reconnects.</p>}
       {workerRows}
     </section>
+  );
+}
+
+function workerIsSupersededHistory(worker: GoalWorkerCardData, workers: GoalWorkerCardData[]): boolean {
+  if (!["completed", "failed", "cancelled"].includes(worker.state)) return false;
+  const workerTime = Date.parse(worker.createdAt || worker.updatedAt || "");
+  if (!Number.isFinite(workerTime)) return false;
+  return workers.some((candidate) => {
+    if (candidate.id === worker.id || candidate.claimLabel !== worker.claimLabel) return false;
+    const candidateTime = Date.parse(candidate.createdAt || candidate.updatedAt || "");
+    return Number.isFinite(candidateTime) && candidateTime > workerTime;
+  });
+}
+
+function GoalWorkerCard({ worker }: { worker: GoalWorkerCardData }) {
+  const tone = workerStateTone(worker.state);
+  return (
+    <details className="worker-card">
+      <summary className="worker-card-summary">
+        <div className="worker-card-identity">
+          <i className={`worker-state ${tone}`} aria-hidden="true" />
+          <div>
+            <strong title={worker.id}>Worker {compactIdentifier(worker.id)}</strong>
+            <span>{humanizeCoordinationState(worker.state)}</span>
+          </div>
+        </div>
+        <span className={`worker-validation ${worker.validation}`}>
+          {worker.validation === "unknown" ? "No validation" : `Validation ${worker.validation}`}
+        </span>
+        <i className="worker-card-chevron" aria-hidden="true" />
+        <p className="worker-claim" title={worker.claimLabel}>{worker.claimLabel}</p>
+      </summary>
+      <div className="worker-card-details">
+        <dl className="worker-metadata">
+          <div><dt>Claim</dt><dd title={worker.claimId || undefined}>{compactIdentifier(worker.claimId)}</dd></div>
+          <div><dt>Package</dt><dd>{worker.packageLabel || (worker.claimId ? "Feature claim" : "None")}</dd></div>
+          <div><dt>Run</dt><dd title={worker.runId || undefined}>{compactIdentifier(worker.runId)}</dd></div>
+          <div><dt>Thread</dt><dd title={worker.threadId || undefined}>{compactIdentifier(worker.threadId)}</dd></div>
+          <div><dt>Workspace</dt><dd title={worker.workspacePath || undefined}>{workspaceName(worker.workspacePath)}</dd></div>
+          <div><dt>Branch</dt><dd title={worker.branch || undefined}>{worker.branch || "Not reported"}</dd></div>
+          <div><dt>Heartbeat</dt><dd title={worker.lastHeartbeatAt || undefined}>{relativeTimestamp(worker.lastHeartbeatAt)}</dd></div>
+        </dl>
+        <div className="worker-activity">
+          <div><span>Latest activity</span><time title={worker.activityAt || undefined}>{relativeTimestamp(worker.activityAt)}</time></div>
+          <p>{worker.activity}</p>
+        </div>
+        {worker.failureMessage && (
+          <div className="worker-failure" role="alert">
+            <strong>{worker.failureCode ? humanizeErrorCode(worker.failureCode) : "Worker run failed"}</strong>
+            <p>{worker.failureMessage}</p>
+            {worker.recoveryGuidance && <small>{worker.recoveryGuidance}</small>}
+          </div>
+        )}
+        {worker.terminationReason && worker.terminationReason !== worker.failureMessage && (
+          <p className="worker-termination"><strong>Termination</strong>{worker.terminationReason}</p>
+        )}
+      </div>
+    </details>
   );
 }
 
@@ -2020,6 +2307,8 @@ function GoalWorkers({
   loading: boolean;
   error: string | null;
 }) {
+  const historicalWorkers = workers.filter((worker) => workerIsSupersededHistory(worker, workers));
+  const currentWorkers = workers.filter((worker) => !historicalWorkers.includes(worker));
   return (
     <section className="detail-section worker-section" aria-labelledby="workers-heading" aria-busy={loading}>
       <div className="section-heading">
@@ -2028,52 +2317,14 @@ function GoalWorkers({
       </div>
       {workers.length ? (
         <div className="worker-list">
-          {workers.map((worker) => {
-            const tone = workerStateTone(worker.state);
-            return (
-              <details className="worker-card" key={worker.id}>
-                <summary className="worker-card-summary">
-                  <div className="worker-card-identity">
-                    <i className={`worker-state ${tone}`} aria-hidden="true" />
-                    <div>
-                      <strong title={worker.id}>Worker {compactIdentifier(worker.id)}</strong>
-                      <span>{humanizeCoordinationState(worker.state)}</span>
-                    </div>
-                  </div>
-                  <span className={`worker-validation ${worker.validation}`}>
-                    {worker.validation === "unknown" ? "No validation" : `Validation ${worker.validation}`}
-                  </span>
-                  <i className="worker-card-chevron" aria-hidden="true" />
-                  <p className="worker-claim" title={worker.claimLabel}>{worker.claimLabel}</p>
-                </summary>
-                <div className="worker-card-details">
-                  <dl className="worker-metadata">
-                    <div><dt>Claim</dt><dd title={worker.claimId || undefined}>{compactIdentifier(worker.claimId)}</dd></div>
-                    <div><dt>Package</dt><dd>{worker.packageLabel || (worker.claimId ? "Feature claim" : "None")}</dd></div>
-                    <div><dt>Run</dt><dd title={worker.runId || undefined}>{compactIdentifier(worker.runId)}</dd></div>
-                    <div><dt>Thread</dt><dd title={worker.threadId || undefined}>{compactIdentifier(worker.threadId)}</dd></div>
-                    <div><dt>Workspace</dt><dd title={worker.workspacePath || undefined}>{workspaceName(worker.workspacePath)}</dd></div>
-                    <div><dt>Branch</dt><dd title={worker.branch || undefined}>{worker.branch || "Not reported"}</dd></div>
-                    <div><dt>Heartbeat</dt><dd title={worker.lastHeartbeatAt || undefined}>{relativeTimestamp(worker.lastHeartbeatAt)}</dd></div>
-                  </dl>
-                  <div className="worker-activity">
-                    <div><span>Latest activity</span><time title={worker.activityAt || undefined}>{relativeTimestamp(worker.activityAt)}</time></div>
-                    <p>{worker.activity}</p>
-                  </div>
-                  {worker.failureMessage && (
-                    <div className="worker-failure" role="alert">
-                      <strong>{worker.failureCode ? humanizeErrorCode(worker.failureCode) : "Worker run failed"}</strong>
-                      <p>{worker.failureMessage}</p>
-                      {worker.recoveryGuidance && <small>{worker.recoveryGuidance}</small>}
-                    </div>
-                  )}
-                  {worker.terminationReason && worker.terminationReason !== worker.failureMessage && (
-                    <p className="worker-termination"><strong>Termination</strong>{worker.terminationReason}</p>
-                  )}
-                </div>
-              </details>
-            );
-          })}
+          {currentWorkers.map((worker) => <GoalWorkerCard worker={worker} key={worker.id} />)}
+          {historicalWorkers.length > 0 && (
+            <details className="worker-history">
+              <summary><span>Worker history</span><em>{historicalWorkers.length} superseded</em><i className="worker-card-chevron" aria-hidden="true" /></summary>
+              <p>Older terminal records are retained for audit. A newer worker has continued the same work.</p>
+              <div>{historicalWorkers.map((worker) => <GoalWorkerCard worker={worker} key={worker.id} />)}</div>
+            </details>
+          )}
         </div>
       ) : (
         <div className="worker-empty">
@@ -3641,6 +3892,11 @@ export default function App() {
   const selectedGoalThreads = selectedGoal
     ? appThreads.filter((thread) => thread.goalId === selectedGoal)
     : [];
+  const selectedGoalRuns = runs.filter((run) => !selectedGoal || run.goal_id === selectedGoal);
+  const workerRunIds = new Set((goalPoolSummary?.workers || []).flatMap((worker) => worker.runId ? [worker.runId] : []));
+  const conversationRuns = selectedGoalRuns.filter((run) => !workerRunIds.has(run.id));
+  const autonomousDetailAttention = (goalPoolSummary?.failedIntegrations || 0)
+    + (goalPoolSummary?.delivery?.data.status === "needs_attention" ? 1 : 0);
 
   useEffect(() => {
     if (!window.desktop?.onMenuCommand) return undefined;
@@ -3993,22 +4249,32 @@ export default function App() {
                     ? current.includes(selectedGoal) ? current : [...current, selectedGoal]
                     : current.filter((goalId) => goalId !== selectedGoal))}
                 >
+                  <SupervisorRuntimeCard resource={goalPoolSummary?.supervisor || null} loading={goalPoolLoading} />
                   <GoalPoolSummaryCard summary={goalPoolSummary} loading={goalPoolLoading} error={goalPoolError} onRetry={() => setGoalPoolRefresh((value) => value + 1)} />
                   <GoalPoolControls goalId={selectedGoal} summary={goalPoolSummary} loading={goalPoolLoading} actor={profileIdentity} permissionMode={permissionMode} onChanged={() => setGoalPoolRefresh((value) => value + 1)} />
                   <GoalWorkers workers={goalPoolSummary?.workers || []} loading={goalPoolLoading} error={goalPoolError} />
-                  <GoalClaimPackageDetails goal={goal} summary={goalPoolSummary} loading={goalPoolLoading} />
-                  <GoalIntegrationView goalId={selectedGoal} integrations={goalPoolSummary?.integrations || []} delivery={goalPoolSummary?.delivery || null} loading={goalPoolLoading} />
                   <GoalEscalationInbox escalations={goalPoolSummary?.escalations || []} loading={goalPoolLoading} />
-                  <GoalActivityTimeline activity={goalPoolSummary?.activity || []} loading={goalPoolLoading} />
+                  <AutonomousDetailsDisclosure
+                    claims={goalPoolSummary?.claims.length || 0}
+                    integrations={goalPoolSummary?.integrations.length || 0}
+                    events={goalPoolSummary?.activity.length || 0}
+                    attentionCount={autonomousDetailAttention}
+                  >
+                    <GoalClaimPackageDetails goal={goal} summary={goalPoolSummary} loading={goalPoolLoading} />
+                    <GoalIntegrationView goalId={selectedGoal} integrations={goalPoolSummary?.integrations || []} delivery={goalPoolSummary?.delivery || null} loading={goalPoolLoading} />
+                    <GoalActivityTimeline activity={goalPoolSummary?.activity || []} loading={goalPoolLoading} />
+                  </AutonomousDetailsDisclosure>
                 </AutonomousExecutionDisclosure>
               )}
-              <details className="detail-section inspector-menu" open>
+              <details className="detail-section inspector-menu">
                 <summary className="section-heading"><h2>Features</h2><span>{goal?.features.length || 0}</span><i aria-hidden="true" /></summary>
                 <div className="feature-list">{goal?.features.length ? goal.features.map((feature) => <FeatureCard feature={feature} slices={(goal.slices || []).filter((slice) => slice.feature_id === feature.id)} key={feature.id} />) : <div className="empty-small">Features added by the skill will appear here.</div>}</div>
               </details>
-              <details className="detail-section activity-section inspector-menu" open>
-                <summary className="section-heading"><h2>Run activity</h2><span>{runs.filter((run) => !selectedGoal || run.goal_id === selectedGoal).length}</span><i aria-hidden="true" /></summary>
-                <div className="activity-list">{runs.filter((run) => !selectedGoal || run.goal_id === selectedGoal).slice(0, 8).map((run) => <div className={`activity ${run.status}`} key={run.id}><i /><div><strong>{run.prompt}</strong><small>{run.events.length} events · {number(run.usage.total_tokens)} tokens</small></div><span>{time(run.created_at)}</span></div>)}</div>
+              <details className="detail-section activity-section inspector-menu">
+                <summary className="section-heading"><h2>Conversation history</h2><span>{conversationRuns.length}</span><i aria-hidden="true" /></summary>
+                {conversationRuns.length
+                  ? <div className="activity-list">{conversationRuns.slice(0, 8).map((run) => <div className={`activity ${run.status}`} key={run.id}><i /><div><strong>{run.prompt}</strong><small>{run.events.length} events · {number(run.usage.total_tokens)} tokens</small></div><span>{time(run.created_at)}</span></div>)}</div>
+                  : <div className="empty-small">Human conversations will appear here. Worker runs are summarized in the worker pool.</div>}
               </details>
             </aside>
           </div>
@@ -4025,6 +4291,7 @@ export default function App() {
 
 export {
   AssistantMessageContent,
+  AutonomousDetailsDisclosure,
   AutonomousExecutionDisclosure,
   GoalActivityTimeline,
   GoalClaimPackageDetails,
@@ -4032,8 +4299,10 @@ export {
   GoalIntegrationView,
   GoalPoolControls,
   GoalPoolSummaryCard,
+  SupervisorRuntimeCard,
   GoalWorkerDock,
   GoalWorkers,
+  latestWorkerRunActivity,
   loadGoalPoolSummary,
   parseWorkerCompletionResult,
   parseWorkerStructuredUpdate,
@@ -4041,6 +4310,7 @@ export {
   ScrollToLatestButton,
   sameThreadTurns,
   unreadResponseDelta,
+  workerNeedsCurrentAttention,
   WorkingUpdateContent,
 };
 export type { GoalPoolSummary, GoalIntegrationArtifactData, GoalEscalationData, GoalWorkerCardData, Goal };

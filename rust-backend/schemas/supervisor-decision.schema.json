@@ -1,0 +1,65 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "trigger_key",
+    "decision",
+    "confidence_percent",
+    "summary",
+    "evidence_event_ids",
+    "evidence_refs",
+    "target_worker_ids",
+    "recommendation",
+    "requested_action",
+    "requires_human_decision",
+    "escalation"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "enum": [1] },
+    "trigger_key": { "type": "string" },
+    "decision": {
+      "type": "string",
+      "enum": ["observe", "inform", "recommend", "coordinate", "block", "escalate"]
+    },
+    "confidence_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "summary": { "type": "string" },
+    "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
+    "evidence_refs": { "type": "array", "items": { "type": "string" } },
+    "target_worker_ids": { "type": "array", "items": { "type": "string" } },
+    "recommendation": { "type": "string" },
+    "requested_action": { "type": ["string", "null"] },
+    "requires_human_decision": { "type": "boolean" },
+    "escalation": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "severity", "scope", "question", "options"],
+          "properties": {
+            "kind": { "type": "string", "enum": ["hard_blocker", "decision_point"] },
+            "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+            "scope": { "type": "string" },
+            "question": { "type": "string" },
+            "options": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "label", "description", "consequences", "recommended"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "label": { "type": "string" },
+                  "description": { "type": "string" },
+                  "consequences": { "type": "array", "items": { "type": "string" } },
+                  "recommended": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
