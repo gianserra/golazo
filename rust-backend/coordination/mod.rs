@@ -32,5 +32,6 @@ pub mod signals;
 pub mod store;
 pub mod supervisor;
 pub mod supervisor_evals;
+pub mod supervisor_runtime;
 pub mod traces;
 pub mod workspace;

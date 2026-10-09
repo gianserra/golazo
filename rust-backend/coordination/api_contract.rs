@@ -243,6 +243,7 @@ impl Default for CoordinationApiManifest {
                 "metrics".into(),
                 "health".into(),
                 "operational-alerts".into(),
+                "supervisor-runtime".into(),
                 "workers".into(),
                 "work-packages".into(),
                 "claims".into(),

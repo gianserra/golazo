@@ -60,6 +60,17 @@ Automated evidence: `human_escalation_journey_presents_blocks_rejects_stale_choi
 
 Automated evidence: `stalled_worker_is_quarantined_replaced_and_recovered_without_duplicate_ownership` and `supervisor_outage_does_not_gate_watchdog_safety_or_later_replay`.
 
+### Live Supervisor runtime
+
+- [ ] Start a pool and produce a real typed worker signal; confirm the backend launches one ephemeral Spec-mode Codex turn with read-only sandboxing and the Supervisor decision schema.
+- [ ] Confirm the structured decision is validated, persisted as an intervention, and delivered only to the affected worker or escalation scope.
+- [ ] Confirm the autonomous console shows Supervisor state, pending triggers, evaluation and token budgets, replay position, current trigger, last decision, and any failure.
+- [ ] Pause or stop the pool during an evaluation; confirm the late result is not applied and the event cursor remains replayable.
+- [ ] Simulate a malformed response or provider failure; confirm workers continue independently, the failure is visible, bounded retry and circuit policy apply, and a later healthy iteration consumes the same durable trigger exactly once.
+- [ ] Restart the backend with an unfinished Supervisor run; confirm run reconciliation leaves the durable trigger available and the monitor safely reevaluates it without duplicating a completed intervention or notification.
+
+Automated evidence: `coordination::supervisor_runtime::tests`, including `production_evaluator_launches_read_only_codex_turn_and_applies_decision`, plus the operator dashboard tests.
+
 ### Restart and disaster recovery
 
 - [ ] Restore a coordination backup and confirm exclusive higher-generation ownership and ordered audit history.
@@ -86,5 +97,5 @@ Automated evidence: `coordination::rollout::tests` and the benchmark described i
 - [ ] The complete Rust, tracker, frontend, typecheck, production build, formatting, and diff gates pass.
 - [ ] `golazo-tracker validate autonomous-worker-architecture` reports a valid tracker.
 - [ ] The tracker has one or zero Next items; zero is expected after the final acceptance slice is recorded.
-- [ ] All 174 implementation steps are complete and the final feature status is `Done`.
+- [ ] Every implementation step is complete and the final feature status is `Done`.
 - [ ] Known operational limits and rollback criteria remain visible in the architecture policy and recovery runbook.

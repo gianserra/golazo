@@ -55,6 +55,7 @@ use crate::coordination::store::{
     NotificationRepository, ReconciliationRepository, SignalRepository, SqliteCoordinationStore,
     StoreError, ValidationReportRepository, WorkPackageRepository, WorkerRepository,
 };
+use crate::coordination::supervisor_runtime::{SupervisorRuntimeSnapshot, runtime_snapshot};
 use crate::coordination::traces::{ClaimTrace, ClaimTraceService, TraceError};
 use crate::models::*;
 use crate::projects::{ProjectRecord, ProjectRegistry};
@@ -354,6 +355,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/coordination/v1/goals/{goal_id}/alerts",
             get(get_coordination_alerts),
+        )
+        .route(
+            "/coordination/v1/goals/{goal_id}/supervisor",
+            get(get_coordination_supervisor),
         )
         .route(
             "/coordination/v1/goals/{goal_id}/pool/commands",
@@ -1440,6 +1445,27 @@ async fn get_coordination_alerts(
             resource_version: resource_version(&snapshot),
             created_at: evaluated_at,
             updated_at: evaluated_at,
+        },
+        snapshot,
+    )))
+}
+
+async fn get_coordination_supervisor(
+    State(state): State<AppState>,
+    AxumPath(goal_id): AxumPath<String>,
+) -> Result<Json<ResourceDocument<SupervisorRuntimeSnapshot>>, CoordinationApiError> {
+    let store = coordination_store(&state).await?;
+    let collected_at = Utc::now();
+    let snapshot = runtime_snapshot(store, Arc::clone(&state.runner), &goal_id)
+        .await
+        .map_err(CoordinationApiError::internal)?;
+    Ok(Json(ResourceDocument::new(
+        "supervisor_runtime",
+        ResourceMetadata {
+            id: goal_id,
+            resource_version: resource_version(&snapshot),
+            created_at: collected_at,
+            updated_at: collected_at,
         },
         snapshot,
     )))
@@ -5791,6 +5817,12 @@ mod tests {
                 .contains(&json!("operational-alerts"))
         );
         assert!(
+            body["resources"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("supervisor-runtime"))
+        );
+        assert!(
             body["commandGroups"]
                 .as_array()
                 .unwrap()
@@ -5841,7 +5873,7 @@ mod tests {
         assert_eq!(health["data"]["operatingMode"], "idle");
         assert_eq!(health["data"]["components"].as_array().unwrap().len(), 11);
         let (status, alerts) = json_request(
-            app,
+            app.clone(),
             "GET",
             "/coordination/v1/goals/metrics-api/alerts",
             Value::Null,
@@ -5852,6 +5884,18 @@ mod tests {
         assert_eq!(alerts["data"]["schema"], "golazo.operational-alerts.v1");
         assert!(alerts["data"]["activeAlerts"].is_array());
         assert!(alerts["data"]["resolvedAlerts"].is_array());
+        let (status, supervisor) = json_request(
+            app,
+            "GET",
+            "/coordination/v1/goals/metrics-api/supervisor",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{supervisor}");
+        assert_eq!(supervisor["kind"], "supervisor_runtime");
+        assert_eq!(supervisor["data"]["goalId"], "metrics-api");
+        assert_eq!(supervisor["data"]["state"], "stopped");
+        assert_eq!(supervisor["data"]["pendingTriggerCount"], 0);
     }
 
     async fn read_sse_until(response: axum::response::Response, marker: &str) -> String {

@@ -1301,10 +1301,16 @@ impl Tracker {
         mut evidence: Vec<String>,
         finalization_id: &str,
     ) -> Result<Value, TrackerError> {
-        if step_ids.is_empty() || summary.trim().is_empty() || finalization_id.trim().is_empty() {
+        if summary.trim().is_empty() || finalization_id.trim().is_empty() {
             return Err(TrackerError::new(
                 422,
-                "integration finalization requires steps, summary, and a durable identity",
+                "integration finalization requires a summary and a durable identity",
+            ));
+        }
+        if status == Status::Done && step_ids.is_empty() {
+            return Err(TrackerError::new(
+                422,
+                "a completed step is required when finalizing as Done",
             ));
         }
         let summary = redact_sensitive_text(summary);
