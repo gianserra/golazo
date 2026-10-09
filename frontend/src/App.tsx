@@ -21,7 +21,16 @@ type Feature = {
   progress: Progress;
   slice_count: number;
 };
-type Goal = { goal_id: string; title: string; features: Feature[]; slices: ImplementationSlice[]; progress: Progress };
+type Goal = {
+  goal_id: string;
+  title: string;
+  description?: string;
+  created_at?: string;
+  updated_at?: string;
+  features: Feature[];
+  slices: ImplementationSlice[];
+  progress: Progress;
+};
 type CoordinationResource<T> = {
   apiVersion: "v1";
   kind: string;
@@ -2844,6 +2853,178 @@ function GoalEscalationInbox({
   );
 }
 
+type GoalWorkspaceView = "chat" | "plan";
+type GoalPlanView = "overview" | "features" | "document" | "history";
+
+function GoalWorkspaceToggle({ view, disabled, onChange }: {
+  view: GoalWorkspaceView;
+  disabled?: boolean;
+  onChange: (view: GoalWorkspaceView) => void;
+}) {
+  return (
+    <div className="goal-workspace-toggle" role="tablist" aria-label="Goal workspace">
+      <button type="button" role="tab" aria-selected={view === "chat"} className={view === "chat" ? "active" : ""} onClick={() => onChange("chat")}>Chat</button>
+      <button type="button" role="tab" aria-selected={view === "plan"} className={view === "plan" ? "active" : ""} onClick={() => onChange("plan")} disabled={disabled}>Plan</button>
+    </div>
+  );
+}
+
+function PlanFeatureSummary({ feature, emphasizeNext = false }: { feature: Feature; emphasizeNext?: boolean }) {
+  const nextStep = feature.steps.find((step) => step.next && !step.done);
+  const remaining = feature.steps.filter((step) => !step.done);
+  const progressLabel = remaining.length > 0
+    ? `${remaining.length} left`
+    : feature.status === "Done"
+      ? "Complete"
+      : "Needs closure";
+  return (
+    <details className={`plan-feature-summary ${emphasizeNext || nextStep ? "has-next" : ""}`}>
+      <summary>
+        <div><strong>{feature.title}</strong><span>{feature.description || "No feature description recorded."}</span></div>
+        <div className="plan-feature-progress"><b>{feature.progress.completion_rate}%</b><small>{progressLabel}</small></div>
+        <i aria-hidden="true" />
+      </summary>
+      <div className="plan-feature-summary-body">
+        <div className="plan-mini-track" role="progressbar" aria-label={`${feature.title} progress`} aria-valuenow={feature.progress.completion_rate} aria-valuemin={0} aria-valuemax={100}><span style={{ width: `${feature.progress.completion_rate}%` }} /></div>
+        <div className="plan-step-list">
+          {feature.steps.map((step) => (
+            <div className={`${step.done ? "done" : ""} ${step.next ? "next" : ""}`} key={step.id}>
+              <span aria-hidden="true">{step.done ? "✓" : step.next ? "→" : "○"}</span>
+              <p>{step.title}</p>
+              {step.next && !step.done && <em>Next</em>}
+            </div>
+          ))}
+        </div>
+      </div>
+    </details>
+  );
+}
+
+const structuredGoalLabels = new Set(["Goal type", "Success criteria", "Assumptions", "Open decisions", "Non-goals"]);
+
+function GoalDescriptionContent({ description }: { description?: string }) {
+  if (!description?.trim()) return <p>No goal description recorded.</p>;
+
+  const blocks = description.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
+    const match = line.match(/^([^:]+):\s*(.*)$/);
+    if (!match || !structuredGoalLabels.has(match[1].trim())) return { label: null, values: [line] };
+    return {
+      label: match[1].trim(),
+      values: match[2].split(/;\s*/).map((item) => item.trim()).filter(Boolean),
+    };
+  });
+
+  return (
+    <div className="plan-goal-copy">
+      {blocks.map((block, index) => {
+        if (!block.label) return <p key={`goal-copy-${index}`}>{block.values[0]}</p>;
+        if (block.label === "Goal type") return <p className="plan-goal-type" key={`goal-copy-${index}`}><span>{block.label}</span><strong>{block.values.join("; ").replace(/[.;]+$/, "")}</strong></p>;
+        return (
+          <section className="plan-goal-section" key={`goal-copy-${index}`}>
+            <h4>{block.label}</h4>
+            {block.values.length > 1 ? <ul>{block.values.map((value, valueIndex) => <li key={`${index}-${valueIndex}`}>{value}</li>)}</ul> : <p>{block.values[0]}</p>}
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
+function GoalPlanWorkspace({ goal, hidden = false }: { goal: Goal | null; hidden?: boolean }) {
+  const [view, setView] = useState<GoalPlanView>("overview");
+  useEffect(() => setView("overview"), [goal?.goal_id]);
+  if (!goal) return <section className="goal-plan-workspace" hidden={hidden}><div className="plan-empty"><h2>Select a goal to view its plan</h2><p>The implementation roadmap will appear here.</p></div></section>;
+
+  const incompleteFeatures = goal.features.filter((feature) => feature.status !== "Done" || feature.progress.completion_rate < 100);
+  const completedFeatures = goal.features.filter((feature) => feature.status === "Done" && feature.progress.completion_rate === 100);
+  const blockedFeatures = incompleteFeatures.filter((feature) => feature.status === "Blocked");
+  const nextItems = goal.features.flatMap((feature) => feature.steps
+    .filter((step) => step.next && !step.done)
+    .map((step) => ({ feature, step })));
+  const laterItems = incompleteFeatures.flatMap((feature) => feature.steps
+    .filter((step) => !step.done && !step.next)
+    .map((step) => ({ feature, step }))).slice(0, 5);
+  const recentSlices = [...goal.slices].sort((left, right) => right.at.localeCompare(left.at));
+  const sourcePath = `.goal-manager/${goal.goal_id}/implementation.md`;
+  const statusCounts = goal.features.reduce((counts, feature) => {
+    counts[feature.status] += 1;
+    return counts;
+  }, { Done: 0, Partial: 0, Planned: 0, Blocked: 0 });
+
+  return (
+    <section className="goal-plan-workspace" hidden={hidden} aria-label="Implementation plan">
+      <header className="plan-heading">
+        <div><p className="eyebrow">Implementation plan</p><h2>{goal.title}</h2><span className="plan-source">Source of truth · <code>{sourcePath}</code></span></div>
+        <div className="plan-total"><strong>{goal.progress.completion_rate}%</strong><span>{goal.progress.completed_steps} of {goal.progress.total_steps} steps complete</span><div className="plan-total-track" role="progressbar" aria-label="Goal progress" aria-valuenow={goal.progress.completion_rate} aria-valuemin={0} aria-valuemax={100}><i style={{ width: `${goal.progress.completion_rate}%` }} /></div></div>
+      </header>
+      <nav className="plan-tabs" role="tablist" aria-label="Plan views">
+        {(["overview", "features", "document", "history"] as GoalPlanView[]).map((item) => (
+          <button type="button" role="tab" aria-selected={view === item} className={view === item ? "active" : ""} onClick={() => setView(item)} key={item}>{humanizeCoordinationState(item)}</button>
+        ))}
+      </nav>
+
+      <div className="plan-view" role="tabpanel">
+        {view === "overview" && (
+          <div className="plan-overview-grid">
+            <div>
+              <div className="plan-section-heading"><h3>What happens next</h3><span>{nextItems.length === 1 ? "One focused slice" : `${nextItems.length} selected steps`}</span></div>
+              {nextItems.length ? nextItems.map(({ feature, step }) => (
+                <article className="plan-next-card" key={`${feature.id}-${step.id}`}>
+                  <div><span>Next</span><em>{feature.title}</em></div>
+                  <h3>{step.title}</h3>
+                  {feature.description && <p>{feature.description}</p>}
+                  <footer><span>{feature.progress.completed_steps} of {feature.progress.total_steps} feature steps complete</span><b>{feature.progress.completion_rate}%</b></footer>
+                </article>
+              )) : <div className="plan-empty-card"><strong>No next slice selected</strong><p>Use Spec mode to choose the next coherent implementation step.</p></div>}
+
+              <div className="plan-section-heading after"><h3>After this slice</h3><span>Likely sequence</span></div>
+              <div className="plan-after-list">
+                {laterItems.length ? laterItems.map(({ feature, step }, index) => (
+                  <div key={`${feature.id}-${step.id}`}><b>{index + 1}</b><span><strong>{step.title}</strong><small>{feature.title}</small></span></div>
+                )) : <div className="plan-empty-card"><strong>No later work recorded</strong><p>The remaining tracker is complete.</p></div>}
+              </div>
+            </div>
+            <aside>
+              <div className="plan-section-heading"><h3>Bigger picture</h3><span>{goal.features.length} features</span></div>
+              <div className="plan-rollup">
+                <div><strong>Complete</strong><b>{statusCounts.Done}</b><span>{completedFeatures.reduce((count, feature) => count + feature.progress.completed_steps, 0)} verified steps</span></div>
+                <div><strong>In progress</strong><b className="attention">{statusCounts.Partial}</b><span>{incompleteFeatures.filter((feature) => feature.status === "Partial").reduce((count, feature) => count + feature.steps.filter((step) => !step.done).length, 0)} steps remaining</span></div>
+                <div><strong>Planned</strong><b>{statusCounts.Planned}</b><span>Not started or awaiting priority</span></div>
+                {statusCounts.Blocked > 0 && <div><strong>Blocked</strong><b className="blocked">{statusCounts.Blocked}</b><span>Requires a decision or external change</span></div>}
+              </div>
+              <div className={`plan-health-note ${blockedFeatures.length ? "blocked" : ""}`}><strong>{blockedFeatures.length ? `${blockedFeatures.length} blocked feature${blockedFeatures.length === 1 ? "" : "s"}` : "No hard blockers"}</strong><p>{blockedFeatures.length ? blockedFeatures.map((feature) => feature.title).join(" · ") : nextItems.length ? "The selected next slice can proceed from the current tracker state." : "The tracker is valid, but no next slice is currently selected."}</p></div>
+              <div className="plan-recent"><h3>Recently completed</h3>{recentSlices.slice(0, 4).map((slice) => <div key={slice.id}><i /><span><strong>{slice.summary}</strong><small>{relativeTimestamp(slice.at)}</small></span></div>)}</div>
+            </aside>
+          </div>
+        )}
+
+        {view === "features" && (
+          <div className="plan-feature-view">
+            <section><div className="plan-section-heading"><h3>Open features</h3><span>{incompleteFeatures.length}</span></div><div className="plan-feature-list">{incompleteFeatures.length ? incompleteFeatures.map((feature) => <PlanFeatureSummary feature={feature} emphasizeNext={feature.steps.some((step) => step.next)} key={feature.id} />) : <div className="plan-empty-card"><strong>All features complete</strong></div>}</div></section>
+            <details className="plan-completed-features"><summary><span><strong>Completed features</strong><small>Verified implementation retained for reference</small></span><b>{completedFeatures.length}</b><i aria-hidden="true" /></summary><div className="plan-feature-list">{completedFeatures.map((feature) => <PlanFeatureSummary feature={feature} key={feature.id} />)}</div></details>
+          </div>
+        )}
+
+        {view === "document" && (
+          <div className="plan-document-layout">
+            <aside className="plan-outline"><strong>Outline</strong><a href="#plan-goal">Goal</a>{incompleteFeatures.map((feature) => <a href={`#plan-${feature.id}`} key={feature.id}>{feature.title}</a>)}<a href="#plan-completed">Completed features</a></aside>
+            <article className="plan-document">
+              <section id="plan-goal"><p className="eyebrow">Goal</p><h3>{goal.title}</h3><GoalDescriptionContent description={goal.description} /></section>
+              {incompleteFeatures.map((feature) => <section className="plan-document-feature" id={`plan-${feature.id}`} key={feature.id}><header><h3>{feature.title}</h3><span className={`feature-status ${feature.status}`}>{feature.status} · {feature.progress.completion_rate}%</span></header>{feature.description && <p>{feature.description}</p>}<ul>{feature.steps.map((step) => <li className={step.next ? "next" : ""} key={step.id}><span>{step.done ? "✓" : step.next ? "→" : "○"}</span><p>{step.title}</p>{step.next && <em>Next</em>}</li>)}</ul></section>)}
+              <details className="plan-document-completed" id="plan-completed"><summary>{completedFeatures.length} completed features</summary>{completedFeatures.map((feature) => <div key={feature.id}><strong>{feature.title}</strong><span>{feature.progress.total_steps} verified steps · {feature.slice_count} slices</span></div>)}</details>
+            </article>
+            <aside className="plan-document-meta"><div><span>Status rollup</span><strong>{goal.progress.completion_rate}%</strong><p>Calculated from tracker steps by Golazo.</p></div><div><span>Tracker health</span><strong>{blockedFeatures.length ? "Attention" : "Valid"}</strong><p>{blockedFeatures.length ? "Blocked work is visible in the plan." : nextItems.length ? "The plan can continue from its selected next slice." : "No next slice is selected."}</p></div>{goal.updated_at && <div><span>Last updated</span><strong>{relativeTimestamp(goal.updated_at)}</strong><p>{new Date(goal.updated_at).toLocaleString()}</p></div>}</aside>
+          </div>
+        )}
+
+        {view === "history" && (
+          <div className="plan-history-view"><div className="plan-section-heading"><h3>Implementation history</h3><span>{recentSlices.length} slices</span></div>{recentSlices.length ? <div className="plan-history-list">{recentSlices.map((slice) => <article key={slice.id}><i /><div><header><strong>{slice.summary}</strong><span className={`feature-status ${slice.status}`}>{slice.status}</span></header><p>{goal.features.find((feature) => feature.id === slice.feature_id)?.title || slice.feature_id} · {slice.id}</p>{slice.evidence.length > 0 && <details><summary>{slice.evidence.length} evidence reference{slice.evidence.length === 1 ? "" : "s"}</summary><ul>{slice.evidence.map((evidence) => <li key={evidence}>{evidence}</li>)}</ul></details>}</div><time title={slice.at}>{relativeTimestamp(slice.at)}</time></article>)}</div> : <div className="plan-empty-card"><strong>No implementation history yet</strong></div>}</div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function FeatureCard({ feature, slices }: { feature: Feature; slices: ImplementationSlice[] }) {
   return (
     <details className="feature">
@@ -3200,6 +3381,7 @@ export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [collapsedProjects, setCollapsedProjects] = useState<string[]>(loadCollapsedProjects);
   const [expandedAutonomousGoals, setExpandedAutonomousGoals] = useState<string[]>(loadExpandedAutonomousGoals);
+  const [goalWorkspaceView, setGoalWorkspaceView] = useState<GoalWorkspaceView>("chat");
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [appThreads, setAppThreads] = useState<AppServerThread[]>([]);
   const [appHistory, setAppHistory] = useState<AppServerThread | null>(null);
@@ -3975,7 +4157,7 @@ export default function App() {
 
         <main className="workspace">
           <header className={`topbar ${window.desktop ? "desktop-drag-region" : ""}`}>
-            <div><p className="eyebrow">Active goal</p><h1>{goal?.title || "Choose a goal"}</h1></div>
+            <div className="goal-heading"><p className="eyebrow">Active goal</p><div className="goal-title-row"><h1>{goal?.title || "Choose a goal"}</h1><GoalWorkspaceToggle view={goalWorkspaceView} disabled={!goal} onChange={setGoalWorkspaceView} /></div></div>
             <div className="topbar-metrics">
               <div className="token-strip" aria-label="Token usage">
                 <div><span>Total tokens</span><strong>{number(usage.total_tokens)}</strong></div>
@@ -4020,7 +4202,7 @@ export default function App() {
             </div>
           </header>
 
-          <div className="content-grid">
+          <div className="content-grid" hidden={goalWorkspaceView !== "chat"}>
             <section className="chat-panel" aria-label="Codex conversation">
               <div className="chat-header">
                 <div className="thread-controls">
@@ -4278,6 +4460,7 @@ export default function App() {
               </details>
             </aside>
           </div>
+          <GoalPlanWorkspace goal={goal} hidden={goalWorkspaceView !== "plan"} />
         </main>
       </div>
 
@@ -4297,10 +4480,12 @@ export {
   GoalClaimPackageDetails,
   GoalEscalationInbox,
   GoalIntegrationView,
+  GoalPlanWorkspace,
   GoalPoolControls,
   GoalPoolSummaryCard,
   SupervisorRuntimeCard,
   GoalWorkerDock,
+  GoalWorkspaceToggle,
   GoalWorkers,
   latestWorkerRunActivity,
   loadGoalPoolSummary,
