@@ -9,10 +9,12 @@ import {
   GoalClaimPackageDetails,
   GoalEscalationInbox,
   GoalIntegrationView,
+  GoalPlanWorkspace,
   GoalPoolControls,
   GoalPoolSummaryCard,
   GoalWorkerDock,
   GoalWorkers,
+  GoalWorkspaceToggle,
   api,
   latestWorkerRunActivity,
   loadGoalPoolSummary,
@@ -234,6 +236,74 @@ describe("conversation scrolling", () => {
     expect(screen.getByText("3")).toBeTruthy();
     fireEvent.click(button);
     expect(onClick).toHaveBeenCalledOnce();
+  });
+});
+
+describe("goal plan workspace", () => {
+  const planGoal: Goal = {
+    goal_id: "plan-goal",
+    title: "Plan goal",
+    description: "Deliver the complete implementation with a clear audit trail.",
+    updated_at: now,
+    progress: { completed_steps: 3, total_steps: 5, completion_rate: 60 },
+    features: [
+      {
+        id: "active-feature",
+        title: "Active feature",
+        description: "Finish the user-facing planning workflow.",
+        status: "Partial",
+        progress: { completed_steps: 1, total_steps: 3, completion_rate: 33 },
+        slice_count: 1,
+        steps: [
+          { id: "complete", title: "Complete foundation", done: true },
+          { id: "next", title: "Build the plan workspace", done: false, next: true },
+          { id: "later", title: "Verify the responsive layout", done: false },
+        ],
+      },
+      {
+        id: "done-feature",
+        title: "Done feature",
+        description: "Already verified.",
+        status: "Done",
+        progress: { completed_steps: 2, total_steps: 2, completion_rate: 100 },
+        slice_count: 1,
+        steps: [
+          { id: "done-one", title: "Implement the first part", done: true },
+          { id: "done-two", title: "Verify the first part", done: true },
+        ],
+      },
+    ],
+    slices: [{ id: "slice-000001", feature_id: "done-feature", at: now, summary: "Completed the first feature", status: "Done", evidence: ["pnpm test"] }],
+  };
+
+  it("switches between Chat and Plan as a primary goal workspace", () => {
+    const onChange = vi.fn();
+    render(<GoalWorkspaceToggle view="chat" onChange={onChange} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Plan" }));
+    expect(onChange).toHaveBeenCalledWith("plan");
+    expect(screen.getByRole("tab", { name: "Chat" }).getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("presents next work, remaining features, the rendered document, and slice history", () => {
+    render(<GoalPlanWorkspace goal={planGoal} />);
+
+    expect(screen.getByText("Build the plan workspace")).toBeTruthy();
+    expect(screen.getByText("Bigger picture")).toBeTruthy();
+    expect(screen.getByText("No hard blockers")).toBeTruthy();
+    expect(screen.getByText(".goal-manager/plan-goal/implementation.md")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Features" }));
+    expect(screen.getByText("Open features")).toBeTruthy();
+    expect(screen.getByText("Completed features")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Document" }));
+    expect(screen.getByText("Deliver the complete implementation with a clear audit trail.")).toBeTruthy();
+    expect(screen.getByText("Calculated from tracker steps by Golazo.")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: "History" }));
+    expect(screen.getByText("Implementation history")).toBeTruthy();
+    expect(screen.getByText("Completed the first feature")).toBeTruthy();
   });
 });
 
